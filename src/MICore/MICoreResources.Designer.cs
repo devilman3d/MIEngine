@@ -71,6 +71,15 @@ namespace MICore {
         }
         
         /// <summary>
+        ///   Looks up a localized string similar to Both &apos;{0}&apos; and &apos;{1}&apos; cannot be specified at the same time..
+        /// </summary>
+        public static string Error_CannotSpecifyBoth {
+            get {
+                return ResourceManager.GetString("Error_CannotSpecifyBoth", resourceCulture);
+            }
+        }
+        
+        /// <summary>
         ///   Looks up a localized string similar to Internal error in MIEngine. Exception of type &apos;{0}&apos; was thrown.
         ///
         ///{1}.
@@ -82,7 +91,7 @@ namespace MICore {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Unable to establish a connection to {0}. Go to the &apos;Debug&apos; pane of the Visual Studio output window for more information..
+        ///   Looks up a localized string similar to Unable to establish a connection to {0}. Debug output may contain more information..
         /// </summary>
         public static string Error_DebuggerInitializeFailed_NoStdErr {
             get {
@@ -149,6 +158,15 @@ namespace MICore {
         }
         
         /// <summary>
+        ///   Looks up a localized string similar to Internal file &quot;{0}&quot; could not be found..
+        /// </summary>
+        public static string Error_InternalFileMissing {
+            get {
+                return ResourceManager.GetString("Error_InternalFileMissing", resourceCulture);
+            }
+        }
+        
+        /// <summary>
         ///   Looks up a localized string similar to Launch options string provided by the project system is invalid. {0}.
         /// </summary>
         public static string Error_InvalidLaunchOptions {
@@ -158,11 +176,29 @@ namespace MICore {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Invalid path to executable file path &apos;{0}&apos;. File must be a valid file name that exists on the Visual Studio computer..
+        ///   Looks up a localized string similar to Invalid path to core dump file &apos;{0}&apos;. File must be a valid file name that exists on the computer..
+        /// </summary>
+        public static string Error_InvalidLocalCoreDumpPath {
+            get {
+                return ResourceManager.GetString("Error_InvalidLocalCoreDumpPath", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Invalid path to executable file path &apos;{0}&apos;. File must be a valid file name that exists..
         /// </summary>
         public static string Error_InvalidLocalExePath {
             get {
                 return ResourceManager.GetString("Error_InvalidLocalExePath", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to The value of miDebuggerPath is invalid.
+        /// </summary>
+        public static string Error_InvalidMiDebuggerPath {
+            get {
+                return ResourceManager.GetString("Error_InvalidMiDebuggerPath", resourceCulture);
             }
         }
         
@@ -172,6 +208,15 @@ namespace MICore {
         public static string Error_LauncherNotFound {
             get {
                 return ResourceManager.GetString("Error_LauncherNotFound", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Failed to initialize debugger terminal..
+        /// </summary>
+        public static string Error_LocalUnixTerminalDebuggerInitializationFailed {
+            get {
+                return ResourceManager.GetString("Error_LocalUnixTerminalDebuggerInitializationFailed", resourceCulture);
             }
         }
         
@@ -203,11 +248,29 @@ namespace MICore {
         }
         
         /// <summary>
+        ///   Looks up a localized string similar to Unable to determine path to debugger.  Please specify the &quot;MIDebuggerPath&quot; option..
+        /// </summary>
+        public static string Error_NoMiDebuggerPath {
+            get {
+                return ResourceManager.GetString("Error_NoMiDebuggerPath", resourceCulture);
+            }
+        }
+        
+        /// <summary>
         ///   Looks up a localized string similar to Unable to execute command. The MIEngine is not currently debugging any process..
         /// </summary>
         public static string Error_NoMIDebuggerProcess {
             get {
                 return ResourceManager.GetString("Error_NoMIDebuggerProcess", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to No terminal is available to launch the debugger.  Please install Gnome Terminal or XTerm..
+        /// </summary>
+        public static string Error_NoTerminalAvailable_Linux {
+            get {
+                return ResourceManager.GetString("Error_NoTerminalAvailable_Linux", resourceCulture);
             }
         }
         
@@ -275,6 +338,15 @@ namespace MICore {
         }
         
         /// <summary>
+        ///   Looks up a localized string similar to Internal error: unable to serialize launch options..
+        /// </summary>
+        public static string Error_UnknownLaunchOptions {
+            get {
+                return ResourceManager.GetString("Error_UnknownLaunchOptions", resourceCulture);
+            }
+        }
+        
+        /// <summary>
         ///   Looks up a localized string similar to Unknown or unsupported target architecture &apos;{0}&apos;..
         /// </summary>
         public static string Error_UnknownTargetArchitecture {
@@ -298,6 +370,33 @@ namespace MICore {
         public static string Status_BreakpointPending {
             get {
                 return ResourceManager.GetString("Status_BreakpointPending", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Superuser access is required to attach to a process. Attaching as superuser can potentially harm your computer. Do you want to continue? [y/N].
+        /// </summary>
+        public static string Warn_AttachAsRootProcess {
+            get {
+                return ResourceManager.GetString("Warn_AttachAsRootProcess", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Attempt to execute {0} failed with exception {1}.
+        /// </summary>
+        public static string Warn_ProcessException {
+            get {
+                return ResourceManager.GetString("Warn_ProcessException", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to {0} exited with exit code {1}.
+        /// </summary>
+        public static string Warn_ProcessExit {
+            get {
+                return ResourceManager.GetString("Warn_ProcessExit", resourceCulture);
             }
         }
     }

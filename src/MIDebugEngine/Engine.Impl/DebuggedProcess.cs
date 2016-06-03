@@ -13,8 +13,11 @@ using System.Threading.Tasks;
 using System.IO;
 using System.Linq;
 using System.Globalization;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using Microsoft.DebugEngineHost;
+
+using Logger = MICore.Logger;
 
 namespace Microsoft.MIDebugEngine
 {
@@ -23,11 +26,13 @@ namespace Microsoft.MIDebugEngine
         public AD_PROCESS_ID Id { get; private set; }
         public AD7Engine Engine { get; private set; }
         public List<string> VariablesToDelete { get; private set; }
+        public List<IVariableInformation> ActiveVariables { get; private set; }
 
         public SourceLineCache SourceLineCache { get; private set; }
         public ThreadCache ThreadCache { get; private set; }
         public Disassembly Disassembly { get; private set; }
         public ExceptionManager ExceptionManager { get; private set; }
+        public CygwinFilePathMapper CygwinFilePathMapper { get; private set; }
 
         private List<DebuggedModule> _moduleList;
         private ISampleEngineCallback _callback;
@@ -35,7 +40,6 @@ namespace Microsoft.MIDebugEngine
         private StringBuilder _pendingMessages;
         private WorkerThread _worker;
         private BreakpointManager _breakpointManager;
-        private bool _bEntrypointHit;
         private ResultEventArgs _initialBreakArgs;
         private List<string> _libraryLoaded;   // unprocessed library loaded messages
         private uint _loadOrder;
@@ -44,8 +48,11 @@ namespace Microsoft.MIDebugEngine
         private ReadOnlyCollection<RegisterDescription> _registers;
         private ReadOnlyCollection<RegisterGroup> _registerGroups;
         private readonly EngineTelemetry _engineTelemetry = new EngineTelemetry();
+        private bool _needTerminalReset;
+        private HashSet<Tuple<string, string>> _fileTimestampWarnings;
+        private ProcessSequence _childProcessHandler;
 
-        public DebuggedProcess(bool bLaunched, LaunchOptions launchOptions, ISampleEngineCallback callback, WorkerThread worker, BreakpointManager bpman, AD7Engine engine, HostConfigurationStore configStore) : base(launchOptions)
+        public DebuggedProcess(bool bLaunched, LaunchOptions launchOptions, ISampleEngineCallback callback, WorkerThread worker, BreakpointManager bpman, AD7Engine engine, HostConfigurationStore configStore) : base(launchOptions, engine.Logger)
         {
             uint processExitCode = 0;
             _pendingMessages = new StringBuilder(400);
@@ -55,7 +62,7 @@ namespace Microsoft.MIDebugEngine
             _libraryLoaded = new List<string>();
             _loadOrder = 0;
             MICommandFactory = MICommandFactory.GetInstance(launchOptions.DebuggerMIMode, this);
-            _waitDialog = MICommandFactory.SupportsStopOnDynamicLibLoad() ? new HostWaitDialog(ResourceStrings.LoadingSymbolMessage, ResourceStrings.LoadingSymbolCaption) : null;
+            _waitDialog = (MICommandFactory.SupportsStopOnDynamicLibLoad() && launchOptions.WaitDynamicLibLoad) ? new HostWaitDialog(ResourceStrings.LoadingSymbolMessage, ResourceStrings.LoadingSymbolCaption) : null;
             Natvis = new Natvis.Natvis(this, launchOptions.ShowDisplayString);
 
             // we do NOT have real Win32 process IDs, so we use a guid
@@ -73,6 +80,8 @@ namespace Microsoft.MIDebugEngine
             ExceptionManager = new ExceptionManager(MICommandFactory, _worker, _callback, configStore);
 
             VariablesToDelete = new List<string>();
+            this.ActiveVariables = new List<IVariableInformation>();
+            this._fileTimestampWarnings = new HashSet<Tuple<string, string>>();
 
             OutputStringEvent += delegate (object o, string message)
             {
@@ -159,44 +168,58 @@ namespace Microsoft.MIDebugEngine
             if (_launchOptions is LocalLaunchOptions)
             {
                 LocalLaunchOptions localLaunchOptions = (LocalLaunchOptions)_launchOptions;
-                if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux) &&
-                    _launchOptions.DebuggerMIMode == MIMode.Gdb &&
-                    String.IsNullOrEmpty(localLaunchOptions.MIDebuggerServerAddress)
+
+                if (!localLaunchOptions.IsValidMiDebuggerPath())
+                {
+                    throw new Exception(MICoreResources.Error_InvalidMiDebuggerPath);
+                }
+
+                if (PlatformUtilities.IsOSX() &&
+                    localLaunchOptions.DebuggerMIMode != MIMode.Clrdbg &&
+                    !UnixUtilities.IsBinarySigned(localLaunchOptions.MIDebuggerPath))
+                {
+                    string message = String.Format(CultureInfo.CurrentCulture, ResourceStrings.Warning_DarwinDebuggerUnsigned, localLaunchOptions.MIDebuggerPath);
+                    _callback.OnOutputMessage(new OutputMessage(
+                        message + Environment.NewLine,
+                        enum_MESSAGETYPE.MT_MESSAGEBOX,
+                        OutputMessage.Severity.Warning));
+                }
+
+                ITransport localTransport = null;
+                // For local Linux and OS X launch, use the local Unix transport which creates a new terminal and
+                // uses fifos for debugger (e.g., gdb) communication.
+                if (this.MICommandFactory.UseExternalConsoleForLocalLaunch(localLaunchOptions) &&
+                    (PlatformUtilities.IsLinux() || PlatformUtilities.IsOSX())
                     )
                 {
-                    // For local linux launch, use the local linux transport which creates a new terminal and uses fifos for gdb communication.
-                    // CONSIDER: add new flag and only do this if new terminal is true? Note that setting this to false on linux will cause a deadlock
-                    // during debuggee launch
-                    if (localLaunchOptions.ShouldStartServer())
-                    {
-                        this.Init(new MICore.ClientServerTransport
-                            (
-                                        new LocalLinuxTransport(),
-                                        new ServerTransport(killOnClose: true, filterStdout: localLaunchOptions.FilterStdout, filterStderr: localLaunchOptions.FilterStderr)
-                                  ), _launchOptions
-                            );
-                    }
-                    else
-                    {
-                        this.Init(new MICore.LocalLinuxTransport(), _launchOptions);
-                    }
+                    localTransport = new LocalUnixTerminalTransport();
+
+                    // Only need to clear terminal for Linux and OS X local launch
+                    _needTerminalReset = (localLaunchOptions.ProcessId == 0 && _launchOptions.DebuggerMIMode == MIMode.Gdb);
                 }
                 else
                 {
-                    if (localLaunchOptions.ShouldStartServer())
-                    {
-                        this.Init(new MICore.ClientServerTransport
-                            (
-                                        new LocalTransport(),
-                                        new ServerTransport(killOnClose: true, filterStdout: localLaunchOptions.FilterStdout, filterStderr: localLaunchOptions.FilterStderr)
-                                  ), _launchOptions
-                            );
-                    }
-                    else
-                    {
-                        this.Init(new MICore.LocalTransport(), _launchOptions);
-                    }
+                    localTransport = new LocalTransport();
                 }
+
+                if (localLaunchOptions.ShouldStartServer())
+                {
+                    this.Init(
+                        new MICore.ClientServerTransport(
+                            localTransport,
+                            new ServerTransport(killOnClose: true, filterStdout: localLaunchOptions.FilterStdout, filterStderr: localLaunchOptions.FilterStderr)
+                        ),
+                        _launchOptions);
+                }
+                else
+                {
+                    this.Init(localTransport, _launchOptions);
+                }
+
+                // Only need to know the debugger pid on Linux and OS X local launch to detect whether
+                // the debugger is closed. If the debugger is not running anymore, the response (^exit)
+                // to the -gdb-exit command is faked to allow MIEngine to shut down.
+                SetDebuggerPid(localTransport.DebuggerPid);
             }
             else if (_launchOptions is PipeLaunchOptions)
             {
@@ -284,49 +307,34 @@ namespace Microsoft.MIDebugEngine
             {
                 // NOTE: This is an async void method, so make sure exceptions are caught and somehow reported
 
-                if (_libraryLoaded.Count != 0)
+                if (_needTerminalReset)
                 {
-                    string moduleNames = string.Join(", ", _libraryLoaded);
+                    _needTerminalReset = false;
 
-                    try
-                    {
-                        _libraryLoaded.Clear();
-                        SourceLineCache.OnLibraryLoad();
-
-                        await _breakpointManager.BindAsync();
-                        await CheckModules();
-
-                        _bLastModuleLoadFailed = false;
-                    }
-                    catch (Exception e) when (ExceptionHelper.BeforeCatch(e, reportOnlyCorrupting: true))
-                    {
-                        if (this.ProcessState == MICore.ProcessState.Exited)
-                        {
-                            return; // ignore exceptions after the process has exited
-                        }
-
-                        string exceptionDescription = EngineUtils.GetExceptionDescription(e);
-                        string message = string.Format(CultureInfo.CurrentCulture, MICoreResources.Error_ExceptionProcessingModules, moduleNames, exceptionDescription);
-
-                        // to avoid spamming the user, if the last module failed, we send the next failure to the output windiw instead of a message box
-                        if (!_bLastModuleLoadFailed)
-                        {
-                            _callback.OnError(message);
-                            _bLastModuleLoadFailed = true;
-                        }
-                        else
-                        {
-                            _callback.OnOutputMessage(new OutputMessage(message, enum_MESSAGETYPE.MT_OUTPUTSTRING, OutputMessage.Severity.Warning));
-                        }
-                    }
+                    // This is to work around a GDB bug of warning "Failed to set controlling terminal: Operation not permitted"
+                    // Reset debuggee terminal after the first module load.
+                    await ResetConsole();
                 }
+
+                if (this.MICommandFactory.SupportsStopOnDynamicLibLoad() && !_launchOptions.WaitDynamicLibLoad)
+                {
+                    await CmdAsync("-gdb-set stop-on-solib-events 0", ResultClass.None);
+                }
+
+                await this.EnsureModulesLoaded();
+
+
                 if (_waitDialog != null)
                 {
                     _waitDialog.EndWaitDialog();
                 }
                 if (MICommandFactory.SupportsStopOnDynamicLibLoad())
                 {
-                    CmdContinueAsync();
+                    // Do not continue if debugging core dump
+                    if (!this.IsCoreDump)
+                    {
+                        CmdContinueAsync();
+                    }
                 }
             };
 
@@ -335,7 +343,7 @@ namespace Microsoft.MIDebugEngine
             {
                 // NOTE: This is an async void method, so make sure exceptions are caught and somehow reported
 
-                ResultEventArgs results = args as MICore.Debugger.ResultEventArgs;
+                StoppingEventArgs results = args as MICore.Debugger.StoppingEventArgs;
                 if (_waitDialog != null)
                 {
                     _waitDialog.EndWaitDialog();
@@ -349,9 +357,9 @@ namespace Microsoft.MIDebugEngine
 
                 try
                 {
-                    await HandleBreakModeEvent(results);
+                    await HandleBreakModeEvent(results, results.AsyncRequest);
                 }
-                catch (Exception e) when (ExceptionHelper.BeforeCatch(e, reportOnlyCorrupting: true))
+                catch (Exception e) when (ExceptionHelper.BeforeCatch(e, Logger, reportOnlyCorrupting: true))
                 {
                     if (this.ProcessState == MICore.ProcessState.Exited)
                     {
@@ -377,13 +385,20 @@ namespace Microsoft.MIDebugEngine
             ThreadCreatedEvent += delegate (object o, EventArgs args)
             {
                 ResultEventArgs result = (ResultEventArgs)args;
-                ThreadCache.ThreadEvent(result.Results.FindInt("id"), /*deleted */false);
+                ThreadCache.ThreadCreatedEvent(result.Results.FindInt("id"), result.Results.TryFindString("group-id"));
+                _childProcessHandler?.ThreadCreatedEvent(result.Results);
             };
 
             ThreadExitedEvent += delegate (object o, EventArgs args)
             {
                 ResultEventArgs result = (ResultEventArgs)args;
-                ThreadCache.ThreadEvent(result.Results.FindInt("id"), /*deleted*/true);
+                ThreadCache.ThreadExitedEvent(result.Results.FindInt("id"));
+            };
+
+            ThreadGroupExitedEvent += delegate (object o, EventArgs args)
+            {
+                ResultEventArgs result = (ResultEventArgs)args;
+                ThreadCache.ThreadGroupExitedEvent(result.Results.FindString("id"));
             };
 
             MessageEvent += (object o, ResultEventArgs args) =>
@@ -408,6 +423,46 @@ namespace Microsoft.MIDebugEngine
             BreakChangeEvent += _breakpointManager.BreakpointModified;
         }
 
+        private async Task EnsureModulesLoaded()
+        {
+            if (_libraryLoaded.Count != 0)
+            {
+                string moduleNames = string.Join(", ", _libraryLoaded);
+
+                try
+                {
+                    _libraryLoaded.Clear();
+                    SourceLineCache.OnLibraryLoad();
+
+                    await _breakpointManager.BindAsync();
+                    await CheckModules();
+
+                    _bLastModuleLoadFailed = false;
+                }
+                catch (Exception e) when (ExceptionHelper.BeforeCatch(e, Logger, reportOnlyCorrupting: true))
+                {
+                    if (this.ProcessState == MICore.ProcessState.Exited)
+                    {
+                        return; // ignore exceptions after the process has exited
+                    }
+
+                    string exceptionDescription = EngineUtils.GetExceptionDescription(e);
+                    string message = string.Format(CultureInfo.CurrentCulture, MICoreResources.Error_ExceptionProcessingModules, moduleNames, exceptionDescription);
+
+                    // to avoid spamming the user, if the last module failed, we send the next failure to the output windiw instead of a message box
+                    if (!_bLastModuleLoadFailed)
+                    {
+                        _callback.OnError(message);
+                        _bLastModuleLoadFailed = true;
+                    }
+                    else
+                    {
+                        _callback.OnOutputMessage(new OutputMessage(message, enum_MESSAGETYPE.MT_OUTPUTSTRING, OutputMessage.Severity.Warning));
+                    }
+                }
+            }
+        }
+
         public async Task Initialize(HostWaitLoop waitLoop, CancellationToken token)
         {
             bool success = false;
@@ -420,6 +475,7 @@ namespace Microsoft.MIDebugEngine
             {
                 await this.MICommandFactory.EnableTargetAsyncOption();
                 List<LaunchCommand> commands = GetInitializeCommands();
+                _childProcessHandler?.Enable();
 
                 total = commands.Count();
                 var i = 0;
@@ -430,18 +486,50 @@ namespace Microsoft.MIDebugEngine
                     if (command.IsMICommand)
                     {
                         Results results = await CmdAsync(command.CommandText, ResultClass.None);
-                        if (results.ResultClass == ResultClass.error && !command.IgnoreFailures)
+                        if (results.ResultClass == ResultClass.error)
                         {
-                            string miError = results.FindString("msg");
-                            throw new UnexpectedMIResultException(MICommandFactory.Name, command.CommandText, miError);
+                            if (command.FailureHandler != null)
+                            {
+                                command.FailureHandler(results.FindString("msg"));
+                            }
+                            else if (!command.IgnoreFailures)
+                            {
+                                string miError = results.FindString("msg");
+                                throw new UnexpectedMIResultException(MICommandFactory.Name, command.CommandText, miError);
+                            }
+                        }
+                        else
+                        {
+                            if (command.SuccessHandler != null)
+                            {
+                                command.SuccessHandler(results.ToString());
+                            }
                         }
                     }
                     else
                     {
-                        await ConsoleCmdAsync(command.CommandText);
+                        string resultString = await ConsoleCmdAsync(command.CommandText, command.IgnoreFailures);
+                        if (command.SuccessHandler != null)
+                        {
+                            command.SuccessHandler(resultString);
+                        }
                     }
                 }
 
+                var arch = await MICommandFactory.GetTargetArchitecture();
+                if (arch == TargetArchitecture.Unknown)
+                {
+                    if (LaunchOptions.TargetArchitecture != TargetArchitecture.Unknown)
+                    {
+                        arch = LaunchOptions.TargetArchitecture;
+                    }
+                    else
+                    {
+                        WriteOutput(ResourceStrings.Warning_UsingDefaultArchitecture);
+                        arch = TargetArchitecture.X64;  // use as default
+                    }
+                }
+                SetTargetArch(arch);
 
                 success = true;
             }
@@ -462,17 +550,51 @@ namespace Microsoft.MIDebugEngine
 
             commands.AddRange(_launchOptions.SetupCommands);
 
+            // If the absolute prefix so path has not been specified, then don't set it to null
+            // because the debugger might already have a default.
+            if (!string.IsNullOrEmpty(_launchOptions.AbsolutePrefixSOLibSearchPath))
+            {
+                commands.Add(new LaunchCommand("-gdb-set solib-absolute-prefix " + _launchOptions.AbsolutePrefixSOLibSearchPath));
+            }
+
             // On Windows ';' appears to correctly works as a path seperator and from the documentation, it is ':' on unix
             string pathEntrySeperator = _launchOptions.UseUnixSymbolPaths ? ":" : ";";
             string escappedSearchPath = string.Join(pathEntrySeperator, _launchOptions.GetSOLibSearchPath().Select(path => EscapePath(path, ignoreSpaces: true)));
             if (!string.IsNullOrWhiteSpace(escappedSearchPath))
             {
-                commands.Add(new LaunchCommand("-gdb-set solib-search-path \"" + escappedSearchPath + pathEntrySeperator + "\"", ResourceStrings.SettingSymbolSearchPath));
+                if (_launchOptions.DebuggerMIMode == MIMode.Gdb)
+                {
+                    // Do not place quotes around so paths for gdb
+                    commands.Add(new LaunchCommand("-gdb-set solib-search-path " + escappedSearchPath + pathEntrySeperator, ResourceStrings.SettingSymbolSearchPath));
+
+                }
+                else
+                {
+                    // surround so lib path with quotes in other cases
+                    commands.Add(new LaunchCommand("-gdb-set solib-search-path \"" + escappedSearchPath + pathEntrySeperator + "\"", ResourceStrings.SettingSymbolSearchPath));
+                }
             }
 
             if (this.MICommandFactory.SupportsStopOnDynamicLibLoad())
             {
-                commands.Add(new LaunchCommand("-gdb-set stop-on-solib-events 1"));
+                // Do not stop on shared library load/unload events while debugging core dump.
+                // Also check _needTerminalReset because we need to work around a GDB bug and clear the terminal error message. 
+                // This clear operation can't be done too early (because GDB only generate this message after start debugging) 
+                // or too late (otherwise we might clear debuggee's output). 
+                // The stop cause by first module load seems to be the perfect timing to clear the terminal, 
+                // that's why we still need to initially turn stop-on-solib-events on then turn it off after the first stop.
+                if ((_needTerminalReset || _launchOptions.WaitDynamicLibLoad) && !this.IsCoreDump)
+                {
+                    commands.Add(new LaunchCommand("-gdb-set stop-on-solib-events 1"));
+                }
+            }
+
+            if (MICommandFactory.SupportsChildProcessDebugging())
+            {
+                if (_launchOptions.DebugChildProcesses)
+                {
+                    _childProcessHandler = new DebugUnixChild(this, this._launchOptions);  // TODO: let the user enable/disable this functionality
+                }
             }
 
             // Custom launch options replace the built in launch steps. This is used on iOS
@@ -483,20 +605,40 @@ namespace Microsoft.MIDebugEngine
             }
             else
             {
-                if (_launchOptions is LocalLaunchOptions && ((LocalLaunchOptions)_launchOptions).ProcessId != 0)
+                LocalLaunchOptions localLaunchOptions = _launchOptions as LocalLaunchOptions;
+                if (this.IsCoreDump)
+                {
+                    // Add executable information
+                    this.AddExecutablePathCommand(commands);
+
+                    // Add core dump information (linux/mac does not support quotes around this path but spaces in the path do work)
+                    string coreDump = _launchOptions.UseUnixSymbolPaths ? _launchOptions.CoreDumpPath : EscapePath(_launchOptions.CoreDumpPath);
+                    string coreDumpCommand = _launchOptions.DebuggerMIMode == MIMode.Lldb ? String.Concat("target create --core ", coreDump) : String.Concat("-target-select core ", coreDump);
+                    string coreDumpDescription = String.Format(CultureInfo.CurrentCulture, ResourceStrings.LoadingCoreDumpMessage, _launchOptions.CoreDumpPath);
+                   commands.Add(new LaunchCommand(coreDumpCommand, coreDumpDescription, ignoreFailures: false));
+                }
+                else if (_launchOptions.ProcessId != 0)
                 {
                     // This is an attach
-                    LocalLaunchOptions localLaunchOptions = (LocalLaunchOptions)_launchOptions;
+
+                    CheckCygwin(commands, localLaunchOptions);
 
                     // check for remote
-                    string destination = localLaunchOptions.MIDebuggerServerAddress;
+                    string destination = localLaunchOptions?.MIDebuggerServerAddress;
                     if (!string.IsNullOrEmpty(destination))
                     {
                         commands.Add(new LaunchCommand("-target-select remote " + destination, string.Format(CultureInfo.CurrentUICulture, ResourceStrings.ConnectingMessage, destination)));
                     }
 
                     int pid = localLaunchOptions.ProcessId;
-                    commands.Add(new LaunchCommand(String.Format(CultureInfo.CurrentUICulture, "-target-attach {0}", pid), ignoreFailures: false));
+                    commands.Add(new LaunchCommand(String.Format(CultureInfo.CurrentUICulture, "-target-attach {0}", pid), ignoreFailures: false));                    
+
+                    if (this.MICommandFactory.Mode == MIMode.Lldb)
+                    {
+                        // LLDB finishes attach in break mode. Gdb does finishes in run mode. Issue a continue in lldb to match the gdb behavior
+                        commands.Add(new LaunchCommand("-exec-continue", ignoreFailures: false));
+                    }
+
                     return commands;
                 }
                 else
@@ -513,13 +655,35 @@ namespace Microsoft.MIDebugEngine
                         commands.Add(new LaunchCommand("-environment-cd " + escappedDir));
                     }
 
-                    string exe = EscapePath(_launchOptions.ExePath);
-                    commands.Add(new LaunchCommand("-file-exec-and-symbols " + exe, string.Format(CultureInfo.CurrentUICulture, ResourceStrings.LoadingSymbolMessage, _launchOptions.ExePath)));
+                    if (localLaunchOptions != null &&
+                        PlatformUtilities.IsWindows() &&
+                        this.MICommandFactory.UseExternalConsoleForLocalLaunch(localLaunchOptions))
+                    {
+                        commands.Add(new LaunchCommand("-gdb-set new-console on", ignoreFailures: true));
+                    }
+
+                    CheckCygwin(commands, localLaunchOptions);
+
+                    // Send client version to clrdbg to set the capabilities appropriately
+                    if (this.MICommandFactory.Mode == MIMode.Clrdbg)
+                    {
+                        string version = string.Empty;
+                        var attribute = this.GetType().GetTypeInfo().Assembly.GetCustomAttribute(typeof(System.Reflection.AssemblyFileVersionAttribute)) as AssemblyFileVersionAttribute;
+
+                        if (attribute != null)
+                        {
+                            version = attribute.Version;
+                        }
+
+                        commands.Add(new LaunchCommand("-gdb-set client-version \"" + version + "\""));
+                    }
+
+                    this.AddExecutablePathCommand(commands);
                     commands.Add(new LaunchCommand("-break-insert main", ignoreFailures: true));
 
-                    if (_launchOptions is LocalLaunchOptions)
+                    if (null != localLaunchOptions)
                     {
-                        string destination = ((LocalLaunchOptions)_launchOptions).MIDebuggerServerAddress;
+                        string destination = localLaunchOptions.MIDebuggerServerAddress;
                         if (!string.IsNullOrEmpty(destination))
                         {
                             commands.Add(new LaunchCommand("-target-select remote " + destination, string.Format(CultureInfo.CurrentUICulture, ResourceStrings.ConnectingMessage, destination)));
@@ -529,6 +693,44 @@ namespace Microsoft.MIDebugEngine
             }
 
             return commands;
+        }
+
+        private void CheckCygwin(List<LaunchCommand> commands, LocalLaunchOptions localLaunchOptions)
+        {
+            // If running locally on windows, determine if gdb is running from cygwin
+            if (localLaunchOptions != null && PlatformUtilities.IsWindows() && this.MICommandFactory.Mode == MIMode.Gdb)
+            {
+                // mingw will not implement this command, but to be safe, also check if the results contains the string cygwin.
+                LaunchCommand lc = new LaunchCommand("show configuration", null, true, null, new Action<string>((string resStr) =>
+                {
+                    if (resStr.Contains("cygwin"))
+                    {
+                        this.IsCygwin = true;
+                        this.CygwinFilePathMapper = new CygwinFilePathMapper(this);
+
+                        this._engineTelemetry.SendWindowsRuntimeEnvironment(EngineTelemetry.WindowsRuntimeEnvironment.Cygwin);
+                    }
+                    else
+                    {
+                        // Gdb on windows and not cygwin implies mingw
+                        this._engineTelemetry.SendWindowsRuntimeEnvironment(EngineTelemetry.WindowsRuntimeEnvironment.MinGW);
+                    }
+                }));
+                commands.Add(lc);
+            }
+        }
+
+        private void AddExecutablePathCommand(IList<LaunchCommand> commands)
+        {
+            string exe = EscapePath(_launchOptions.ExePath);
+            string description = string.Format(CultureInfo.CurrentUICulture, ResourceStrings.LoadingSymbolMessage, _launchOptions.ExePath);
+            Action<string> failureHandler = (string miError) =>
+            {
+                string message = string.Format(CultureInfo.CurrentUICulture, ResourceStrings.Error_ExePathInvalid, _launchOptions.ExePath, MICommandFactory.Name, miError);
+                throw new LaunchErrorException(message);
+            };
+
+            commands.Add(new LaunchCommand("-file-exec-and-symbols " + exe, description, ignoreFailures: false, failureHandler: failureHandler));
         }
 
         public override void FlushBreakStateData()
@@ -551,7 +753,7 @@ namespace Microsoft.MIDebugEngine
             Logger.Flush();
         }
 
-        private async Task HandleBreakModeEvent(ResultEventArgs results)
+        private async Task HandleBreakModeEvent(ResultEventArgs results, BreakRequest breakRequest)
         {
             string reason = results.Results.TryFindString("reason");
             int tid;
@@ -565,12 +767,39 @@ namespace Microsoft.MIDebugEngine
                 tid = results.Results.FindInt("thread-id");
             }
 
+            if (_childProcessHandler != null && await _childProcessHandler.Stopped(results.Results, tid))
+            {
+                return;
+            }
+
+            // Any existing variable objects at this point are from the last time we were in break mode, and are
+            //  therefore invalid.  Dispose them so they're marked for cleanup.
+            lock (this.ActiveVariables)
+            {
+                foreach (IVariableInformation varInfo in this.ActiveVariables)
+                {
+                    varInfo.Dispose();
+                }
+                this.ActiveVariables.Clear();
+            }
+
             ThreadCache.MarkDirty();
             MICommandFactory.DefineCurrentThread(tid);
 
             DebuggedThread thread = await ThreadCache.GetThread(tid);
             await ThreadCache.StackFrames(thread);  // prepopulate the break thread in the thread cache
             ThreadContext cxt = await ThreadCache.GetThreadContext(thread);
+
+            if (cxt == null)
+            {
+                // Something went seriously wrong. For instance, this can happen when the primary thread
+                // of an app exits on linux while background threads continue to run with pthread_exit on the main thread
+                // See https://devdiv.visualstudio.com/DefaultCollection/DevDiv/VS%20Diag%20IntelliTrace/_workItems?_a=edit&id=197616&triage=true
+                // for a repro
+                Debug.Fail("Failed to find thread on break event.");
+                throw new Exception(String.Format(CultureInfo.CurrentUICulture, ResourceStrings.MissingThreadBreakEvent, tid));
+            }
+
             ThreadCache.SendThreadEvents(this, null);   // make sure that new threads have been pushed to the UI
 
             //always delete breakpoints pending deletion on break mode
@@ -578,14 +807,11 @@ namespace Microsoft.MIDebugEngine
 
             await _breakpointManager.DeleteBreakpointsPendingDeletion();
 
-            //delete varialbes that have been GC'd
-            List<string> variablesToDelete = new List<string>();
+            // Delete GDB variable objects that have been marked for cleanup
+            List<string> variablesToDelete = null;
             lock (VariablesToDelete)
             {
-                foreach (var variable in VariablesToDelete)
-                {
-                    variablesToDelete.Add(variable);
-                }
+                variablesToDelete = new List<string>(this.VariablesToDelete);
                 VariablesToDelete.Clear();
             }
 
@@ -602,31 +828,52 @@ namespace Microsoft.MIDebugEngine
                 }
             }
 
-            if (String.IsNullOrWhiteSpace(reason) && !_bEntrypointHit)
+            if (String.IsNullOrWhiteSpace(reason) && !this.EntrypointHit)
             {
-                // CLRDBG TODO: Try to verify this code path
-                _bEntrypointHit = true;
+                breakRequest = BreakRequest.None;   // don't let stopping interfere with launch processing
+                this.EntrypointHit = true;
                 CmdContinueAsync();
                 FireDeviceAppLauncherResume();
+            }
+            else if (reason == "entry-point-hit")
+            {
+                this.EntrypointHit = true;
+                _callback.OnEntryPoint(thread);
             }
             else if (reason == "breakpoint-hit")
             {
                 string bkptno = results.Results.FindString("bkptno");
                 ulong addr = cxt.pc ?? 0;
-                
+
                 bool fContinue;
                 TupleValue frame = results.Results.TryFind<TupleValue>("frame");
                 AD7BoundBreakpoint[] bkpt = _breakpointManager.FindHitBreakpoints(bkptno, addr, frame, out fContinue);
                 if (bkpt != null)
                 {
+                    if (frame != null && addr != 0)
+                    {
+                        string sourceFile = frame.TryFindString("fullname");
+                        if (!String.IsNullOrEmpty(sourceFile))
+                        {
+                            await this.VerifySourceFileTimestamp(addr, sourceFile);
+                        }
+                    }
+
+                    // Hitting a bp before the entrypoint overrules entrypoint processing.
+                    this.EntrypointHit = true;
+
                     List<object> bplist = new List<object>();
                     bplist.AddRange(bkpt);
                     _callback.OnBreakpoint(thread, bplist.AsReadOnly());
                 }
-                else if (!_bEntrypointHit)
+                else if (!this.EntrypointHit)
                 {
-                    _bEntrypointHit = true;
+                    this.EntrypointHit = true;
                     _callback.OnEntryPoint(thread);
+                }
+                else if (bkptno == "<EMBEDDED>")
+                {
+                    _callback.OnBreakpoint(thread, new ReadOnlyCollection<object>(new AD7BoundBreakpoint[] { }));
                 }
                 else
                 {
@@ -634,12 +881,41 @@ namespace Microsoft.MIDebugEngine
                     {
                         //we hit a bp pending deletion
                         //post the CmdContinueAsync operation so it does not happen until we have deleted all the pending deletes
-                        CmdContinueAsync();
+                        CmdContinueAsyncConditional(breakRequest);
                     }
                     else
                     {
                         // not one of our breakpoints, so stop with a message
                         _callback.OnException(thread, "Unknown breakpoint", "", 0);
+                    }
+                }
+            }
+            else if (reason == "watchpoint-trigger")
+            {
+                var wpt = results.Results.Find("wpt");
+                string bkptno = wpt.FindString("number");
+                ulong addr = cxt.pc ?? 0;
+
+                bool fContinue;
+                AD7BoundBreakpoint bkpt = _breakpointManager.FindHitWatchpoint(bkptno, out fContinue);
+                if (bkpt != null)
+                {
+                    List<object> bplist = new List<object>();
+                    bplist.Add(bkpt);
+                    _callback.OnBreakpoint(thread, bplist.AsReadOnly());
+                }
+                else
+                {
+                    if (fContinue)
+                    {
+                        //we hit a bp pending deletion
+                        //post the CmdContinueAsync operation so it does not happen until we have deleted all the pending deletes
+                        CmdContinueAsyncConditional(breakRequest);
+                    }
+                    else
+                    {
+                        // not one of our breakpoints, so stop with a message
+                        _callback.OnException(thread, "Unknown watchpoint", "", 0);
                     }
                 }
             }
@@ -653,7 +929,7 @@ namespace Microsoft.MIDebugEngine
                 if ((name == "SIG32") || (name == "SIG33"))
                 {
                     // we are going to ignore these (Sigma) signals for now
-                    CmdContinueAsync();
+                    CmdContinueAsyncConditional(breakRequest);
                 }
                 else if (MICommandFactory.IsAsyncBreakSignal(results.Results))
                 {
@@ -672,7 +948,23 @@ namespace Microsoft.MIDebugEngine
                     {
                         code = EngineUtils.SignalMap.Instance[sigName];
                     }
-                    _callback.OnException(thread, sigName, results.Results.TryFindString("signal-meaning"), code);
+                    bool stoppedAtSIGSTOP = false;
+                    if (sigName == "SIGSTOP")
+                    {
+                        if (AD7Engine.RemoveChildProcess(_launchOptions.ProcessId))
+                        {
+                            stoppedAtSIGSTOP = true;
+                        }
+                    }
+                    string message = results.Results.TryFindString("signal-meaning");
+                    if (stoppedAtSIGSTOP)
+                    {
+                        await MICommandFactory.Signal("SIGCONT");
+                    }
+                    else
+                    {
+                        _callback.OnException(thread, sigName, message, code);
+                    }
                 }
             }
             else if (reason == "exception-received")
@@ -690,8 +982,66 @@ namespace Microsoft.MIDebugEngine
             }
             else
             {
-                Debug.Fail("Unknown stopping reason");
-                _callback.OnException(thread, "Unknown", "Unknown stopping event", 0);
+                if (breakRequest == BreakRequest.None)
+                {
+                    Debug.Fail("Unknown stopping reason");
+                    _callback.OnException(thread, "Unknown", "Unknown stopping event", 0);
+                }
+            }
+            if (breakRequest != BreakRequest.None)
+            {
+                _callback.OnStopComplete(thread);
+            }
+        }
+
+        private void CmdContinueAsyncConditional(BreakRequest request)
+        {
+            if (request != BreakRequest.None)
+            {
+                CmdContinueAsync();
+            }
+        }
+
+        private async Task VerifySourceFileTimestamp(ulong addr, string sourceFilePath)
+        {
+            await this.EnsureModulesLoaded();
+
+            string targetModulePath = this._launchOptions.ExePath;
+            DebuggedModule targetModule = this._moduleList.FirstOrDefault(m => m.AddressInModule(addr));
+            if (targetModule != null)
+            {
+                targetModulePath = targetModule.Name;
+            }
+
+            Tuple<string, string> key = Tuple.Create(sourceFilePath, targetModulePath);
+            if (this._fileTimestampWarnings.Contains(key))
+            {
+                // We've already warned about this file
+                return;
+            }
+
+            try
+            {
+                if (!File.Exists(sourceFilePath) || !File.Exists(targetModulePath))
+                {
+                    return;
+                }
+
+                DateTime sourceFileTimestamp = File.GetLastWriteTimeUtc(sourceFilePath);
+                DateTime moduleFileTimestamp = File.GetLastWriteTimeUtc(targetModulePath);
+
+                if (sourceFileTimestamp > moduleFileTimestamp)
+                {
+                    // Source file is newer than the module - warn the user
+                    this._fileTimestampWarnings.Add(key);
+
+                    string message = String.Format(CultureInfo.CurrentCulture, ResourceStrings.Warning_SourceFileOutOfDate_Arg2, sourceFilePath, targetModulePath);
+                    this._callback.OnOutputMessage(new OutputMessage(message + Environment.NewLine, enum_MESSAGETYPE.MT_OUTPUTSTRING, OutputMessage.Severity.Warning));
+                }
+            }
+            catch (IOException)
+            {
+                // Ignore exceptions related to getting file information
             }
         }
 
@@ -702,17 +1052,20 @@ namespace Microsoft.MIDebugEngine
         internal string EscapePath(string path, bool ignoreSpaces = false)
         {
             if (_launchOptions.UseUnixSymbolPaths)
-                return path.Replace('\\', '/');
+            {
+                path = path.Replace('\\', '/');
+            }
             else
             {
                 path = path.Trim();
                 path = path.Replace(@"\", @"\\");
-                if (!ignoreSpaces && path.IndexOf(' ') != -1)
-                {
-                    path = '"' + path + '"';
-                }
-                return path;
             }
+
+            if (!ignoreSpaces && path.IndexOf(' ') != -1)
+            {
+                path = '"' + path + '"';
+            }
+            return path;
         }
 
         internal static string UnixPathToWindowsPath(string unixPath)
@@ -824,6 +1177,8 @@ namespace Microsoft.MIDebugEngine
 
         public async Task Step(int threadId, enum_STEPKIND kind, enum_STEPUNIT unit)
         {
+            this.VerifyNotDebuggingCoreDump();
+
             await ExceptionManager.EnsureSettingsUpdated();
 
             if ((unit == enum_STEPUNIT.STEP_LINE) || (unit == enum_STEPUNIT.STEP_STATEMENT))
@@ -845,7 +1200,20 @@ namespace Microsoft.MIDebugEngine
             }
             else if (unit == enum_STEPUNIT.STEP_INSTRUCTION)
             {
-                await MICommandFactory.ExecStepInstruction(threadId);
+                switch (kind)
+                {
+                    case enum_STEPKIND.STEP_INTO:
+                        await MICommandFactory.ExecStepInstruction(threadId);
+                        break;
+                    case enum_STEPKIND.STEP_OVER:
+                        await MICommandFactory.ExecNextInstruction(threadId);
+                        break;
+                    case enum_STEPKIND.STEP_OUT:
+                        await MICommandFactory.ExecFinish(threadId);
+                        break;
+                    default:
+                        throw new NotImplementedException();
+                }
             }
             else
             {
@@ -887,20 +1255,21 @@ namespace Microsoft.MIDebugEngine
             {
                 await CheckModules();
                 _libraryLoaded.Clear();
-                await HandleBreakModeEvent(_initialBreakArgs);
+                await HandleBreakModeEvent(_initialBreakArgs, BreakRequest.None);
                 _initialBreakArgs = null;
+            }
+            else if (this.IsCoreDump)
+            {
+                // Set initial state of debug engine to stopped with emulated results
+                this.OnStateChanged("stopped", await this.GenerateStoppedRecordResults());
             }
             else
             {
                 bool attach = false;
-                int attachPid = 0;
-                if (_launchOptions is LocalLaunchOptions)
+                int attachPid = _launchOptions.ProcessId;
+                if (attachPid != 0)
                 {
-                    attachPid = ((LocalLaunchOptions)_launchOptions).ProcessId;
-                    if (attachPid != 0)
-                    {
-                        attach = true;
-                    }
+                    attach = true;
                 }
 
                 if (!attach)
@@ -933,6 +1302,43 @@ namespace Microsoft.MIDebugEngine
             }
         }
 
+        /// <summary>
+        /// Generates results that represent an emulated MI stopped record.
+        /// </summary>
+        private async Task<Results> GenerateStoppedRecordResults()
+        {
+            Results threadInfo = await this.MICommandFactory.ThreadInfo();
+
+            // Get the current thread identifier
+            string currentThreadId = threadInfo.FindString("current-thread-id");
+
+            // Get list of all threads in the process
+            ValueListValue threads = threadInfo.Find<ValueListValue>("threads");
+
+            // Find the thread that is the current thread, which should exist since there is a current thread id value
+            TupleValue currentThread = threads.AsArray<TupleValue>().FirstOrDefault(tv => currentThreadId.Equals(tv.FindString("id"), StringComparison.Ordinal));
+            Debug.Assert(null != currentThread, String.Concat("Unable to find thread with ID ", currentThreadId, "."));
+            if (null == currentThread)
+                throw new UnexpectedMIResultException(this.MICommandFactory.Name, "-thread-info", null);
+
+            // Get the frame of the current thread
+            TupleValue currentFrame = currentThread.Find<TupleValue>("frame");
+
+            // Collect the addr, func, and args fields from the current frame as they are required.
+            // Collect the file, fullname, and line fields if they are available. They may be missing if the frame is for
+            // a binary that does not have symbols.
+            TupleValue newFrame = currentFrame.Subset(
+                new string[] { "addr", "func", "args" },
+                new string[] { "file", "fullname", "line" });
+
+            // Create result that emulates a signal received from the debuggee with the frame and thread information
+            List<NamedResultValue> values = new List<NamedResultValue>();
+            values.Add(new NamedResultValue("reason", new ConstValue("signal-received")));
+            values.Add(new NamedResultValue("frame", newFrame));
+            values.Add(new NamedResultValue("thread-id", new ConstValue(currentThreadId)));
+            return new Results(ResultClass.done, values);
+        }
+
         public void Terminate()
         {
             // Pretend to kill the process, which will tear down the MI Debugger
@@ -944,7 +1350,17 @@ namespace Microsoft.MIDebugEngine
             ScheduleStdOutProcessing(@"*stopped,reason=""exited"",exit-code=""42""");
         }
 
-        public void Detach() { }
+        public void Detach()
+        {
+            // Special casing sending the fake stopped event for clrdbg. 
+            // GDB prints out thread group exit events on mi command "-target-detach" which is handed by method HandleThreadGroupExited
+            // GDB or the debuggee can terminate and those are handled by Terminate and TerminateProcess methods.
+            if (MICommandFactory.Mode == MIMode.Clrdbg)
+            {
+                ScheduleStdOutProcessing(@"*stopped,reason=""disconnected""");
+            }
+        }
+
         public DebuggedModule[] GetModules()
         {
             lock (_moduleList)
@@ -1261,29 +1677,53 @@ namespace Microsoft.MIDebugEngine
             await _breakpointManager.EnableAfterFuncEvalAsync();
         }
 
-        public async Task<List<ulong>> StartAddressesForLine(string file, uint line)
+        /// <summary>
+        /// Finds the line associated with a start address.
+        /// </summary>
+        public async Task<uint> LineForStartAddress(string file, ulong startAddress)
         {
             List<ulong> addresses = new List<ulong>();
-            var srcLines = await SourceLineCache.GetLinesForFile(file);
-            if (srcLines == null || srcLines.Length == 0)
+            SourceLineMap srcLines = await SourceLineCache.GetLinesForFile(file);
+            if (srcLines == null || srcLines.Count == 0)
             {
                 srcLines = await SourceLineCache.GetLinesForFile(System.IO.Path.GetFileName(file));
             }
-            if (srcLines != null && srcLines.Length > 0)
+            if (srcLines == null || srcLines.Count == 0)
+            {
+                return 0;
+            }
+
+            SourceLine srcLine;
+            if (srcLines.TryGetValue(startAddress, out srcLine))
+            {
+                return srcLine.Line;
+            }
+            return 0;
+        }
+
+        public async Task<List<ulong>> StartAddressesForLine(string file, uint line)
+        {
+            List<ulong> addresses = new List<ulong>();
+            SourceLineMap srcLines = await SourceLineCache.GetLinesForFile(file);
+            if (srcLines == null || srcLines.Count == 0)
+            {
+                srcLines = await SourceLineCache.GetLinesForFile(System.IO.Path.GetFileName(file));
+            }
+            if (srcLines != null && srcLines.Count > 0)
             {
                 bool gotoNextFunc = false;
-                foreach (var l in srcLines)
+                foreach (KeyValuePair<ulong, SourceLine> l in srcLines)
                 {
                     if (gotoNextFunc)
                     {
-                        if (l.Line == 0)
+                        if (l.Value.Line == 0)
                         {
                             gotoNextFunc = false;
                         }
                     }
-                    else if (line == l.Line)
+                    else if (line == l.Value.Line)
                     {
-                        addresses.Add(l.AddrStart);
+                        addresses.Add(l.Value.AddrStart);
                         gotoNextFunc = true;
                     }
                 }
@@ -1294,6 +1734,15 @@ namespace Microsoft.MIDebugEngine
                 addresses = await MICommandFactory.StartAddressesForLine(EscapePath(file), line);
             }
             return addresses;
+        }
+
+        /// <summary>
+        /// The clear is done by sending reset string (ESC, c) to terminal STDERR
+        /// </summary>
+        /// <returns></returns>
+        private Task<string> ResetConsole()
+        {
+            return ConsoleCmdAsync(@"shell echo -e \\033c 1>&2");
         }
     }
 }

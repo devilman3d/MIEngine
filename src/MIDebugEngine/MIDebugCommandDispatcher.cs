@@ -16,9 +16,6 @@ namespace Microsoft.MIDebugEngine
 
         public static Task<string> ExecuteCommand(string command)
         {
-            if (string.IsNullOrWhiteSpace(command))
-                throw new ArgumentNullException("command");
-
             DebuggedProcess lastProcess;
             lock (s_processes)
             {
@@ -29,22 +26,34 @@ namespace Microsoft.MIDebugEngine
 
                 lastProcess = s_processes[s_processes.Count - 1];
             }
+            return ExecuteCommand(command, lastProcess);
+        }
+
+        internal static Task<string> ExecuteCommand(string command, DebuggedProcess process, bool ignoreFailures=false)
+        {
+            if (string.IsNullOrWhiteSpace(command))
+                throw new ArgumentNullException("command");
+
+            if (process == null)
+            {
+                throw new InvalidOperationException(MICoreResources.Error_NoMIDebuggerProcess);
+            }
 
             command = command.Trim();
 
             if (command[0] == '-')
             {
-                return ExecuteMiCommand(lastProcess, command);
+                return ExecuteMiCommand(process, command, ignoreFailures);
             }
             else
             {
-                return lastProcess.ConsoleCmdAsync(command);
+                return process.ConsoleCmdAsync(command, ignoreFailures);
             }
         }
 
-        private static async Task<string> ExecuteMiCommand(DebuggedProcess lastProcess, string command)
+        private static async Task<string> ExecuteMiCommand(DebuggedProcess lastProcess, string command, bool ignoreFailures)
         {
-            Results results = await lastProcess.CmdAsync(command, ResultClass.None);
+            Results results = await lastProcess.CmdAsync(command, ignoreFailures ? ResultClass.None : ResultClass.done);
             return results.ToString();
         }
 

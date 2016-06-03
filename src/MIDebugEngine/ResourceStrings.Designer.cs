@@ -89,6 +89,17 @@ namespace Microsoft.MIDebugEngine {
         }
         
         /// <summary>
+        ///   Looks up a localized string similar to Program path &apos;{0}&apos; is missing or invalid.
+        ///
+        ///{1} failed with message: {2}.
+        /// </summary>
+        internal static string Error_ExePathInvalid {
+            get {
+                return ResourceManager.GetString("Error_ExePathInvalid", resourceCulture);
+            }
+        }
+        
+        /// <summary>
         ///   Looks up a localized string similar to Error &quot;{0}&quot; while reading file: {1}.
         /// </summary>
         internal static string ErrorReadingFile {
@@ -143,6 +154,15 @@ namespace Microsoft.MIDebugEngine {
         }
         
         /// <summary>
+        ///   Looks up a localized string similar to Loading core dump {0}.
+        /// </summary>
+        internal static string LoadingCoreDumpMessage {
+            get {
+                return ResourceManager.GetString("LoadingCoreDumpMessage", resourceCulture);
+            }
+        }
+        
+        /// <summary>
         ///   Looks up a localized string similar to Loading Symbols.
         /// </summary>
         internal static string LoadingSymbolCaption {
@@ -166,6 +186,15 @@ namespace Microsoft.MIDebugEngine {
         internal static string LongBind {
             get {
                 return ResourceManager.GetString("LongBind", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Failed to find thread {0} for break event.
+        /// </summary>
+        internal static string MissingThreadBreakEvent {
+            get {
+                return ResourceManager.GetString("MissingThreadBreakEvent", resourceCulture);
             }
         }
         
@@ -265,6 +294,33 @@ namespace Microsoft.MIDebugEngine {
         internal static string VisualizingExpressionMessage {
             get {
                 return ResourceManager.GetString("VisualizingExpressionMessage", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Debugger executable &apos;{0}&apos; is not signed. As a result, debugging may not work properly..
+        /// </summary>
+        internal static string Warning_DarwinDebuggerUnsigned {
+            get {
+                return ResourceManager.GetString("Warning_DarwinDebuggerUnsigned", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Warning: Source file &apos;{0}&apos; is newer than module file &apos;{1}&apos;..
+        /// </summary>
+        internal static string Warning_SourceFileOutOfDate_Arg2 {
+            get {
+                return ResourceManager.GetString("Warning_SourceFileOutOfDate_Arg2", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Warning: Debuggee TargetArchitecture not detected, assuming x86_64..
+        /// </summary>
+        internal static string Warning_UsingDefaultArchitecture {
+            get {
+                return ResourceManager.GetString("Warning_UsingDefaultArchitecture", resourceCulture);
             }
         }
     }

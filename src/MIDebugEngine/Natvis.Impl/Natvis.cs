@@ -18,6 +18,8 @@ using System.IO;
 using Microsoft.DebugEngineHost;
 using System.Reflection;
 
+using Logger = MICore.Logger;
+
 namespace Microsoft.MIDebugEngine.Natvis
 {
     internal class SimpleWrapper : IVariableInformation
@@ -62,6 +64,10 @@ namespace Microsoft.MIDebugEngine.Natvis
         public string EvalDependentExpression(string expr) { return Parent.EvalDependentExpression(expr); }
         public virtual bool IsVisualized { get { return Parent.IsVisualized; } }
         public virtual enum_DEBUGPROP_INFO_FLAGS PropertyInfoFlags { get; set; }
+
+        public void Dispose()
+        {
+        }
     }
 
     internal class VisualizerWrapper : SimpleWrapper
@@ -241,7 +247,7 @@ namespace Microsoft.MIDebugEngine.Natvis
                             if (o is VisualizerType)
                             {
                                 VisualizerType v = (VisualizerType)o;
-                                TypeName t = TypeName.Parse(v.Name);
+                                TypeName t = TypeName.Parse(v.Name, _process.Logger);
                                 if (t != null)
                                 {
                                     lock (_typeVisualizers)
@@ -254,7 +260,7 @@ namespace Microsoft.MIDebugEngine.Natvis
                                 {
                                     foreach (var a in v.AlternativeType)
                                     {
-                                        t = TypeName.Parse(a.Name);
+                                        t = TypeName.Parse(a.Name, _process.Logger);
                                         if (t != null)
                                         {
                                             lock (_typeVisualizers)
@@ -268,7 +274,7 @@ namespace Microsoft.MIDebugEngine.Natvis
                             else if (o is AliasType)
                             {
                                 AliasType a = (AliasType)o;
-                                TypeName t = TypeName.Parse(a.Name);
+                                TypeName t = TypeName.Parse(a.Name, _process.Logger);
                                 if (t != null)
                                 {
                                     lock (_typeVisualizers)
@@ -329,7 +335,7 @@ namespace Microsoft.MIDebugEngine.Natvis
             {
                 // don't allow natvis to mess up debugging
                 // eat any exceptions and return the variable's value
-                Logger.WriteLine("natvis FormatDisplayString: " + e.Message);
+                _process.Logger.WriteLine("natvis FormatDisplayString: " + e.Message);
             }
             finally
             {
@@ -376,7 +382,7 @@ namespace Microsoft.MIDebugEngine.Natvis
             }
             catch (Exception e)
             {
-                Logger.WriteLine("natvis Expand: " + e.Message);    // TODO: add telemetry
+                _process.Logger.WriteLine("natvis Expand: " + e.Message);    // TODO: add telemetry
                 return variable.Children;
             }
         }
@@ -850,7 +856,7 @@ namespace Microsoft.MIDebugEngine.Natvis
                     }
 
                     string newName = ReplaceNamesInExpression(alias.Alias.Value, null, scopedNames);
-                    name = TypeName.Parse(newName);
+                    name = TypeName.Parse(newName, _process.Logger);
                     aliasChain++;
                     if (aliasChain > MAX_ALIAS_CHAIN)
                     {
@@ -872,7 +878,7 @@ namespace Microsoft.MIDebugEngine.Natvis
             {
                 return _vizCache[variable.TypeName];
             }
-            TypeName parsedName = TypeName.Parse(variable.TypeName);
+            TypeName parsedName = TypeName.Parse(variable.TypeName, _process.Logger);
             IVariableInformation var = variable;
             while (parsedName != null)
             {
@@ -891,7 +897,7 @@ namespace Microsoft.MIDebugEngine.Natvis
                 {
                     break;
                 }
-                parsedName = TypeName.Parse(var.TypeName);
+                parsedName = TypeName.Parse(var.TypeName, _process.Logger);
             }
             return null;
         }

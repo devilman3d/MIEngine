@@ -55,7 +55,7 @@ namespace MICore
         /// <summary>
         /// No command should be executed. This is useful if the target is already ready to go.
         /// </summary>
-        None
+        None,
     };
 
     /// <summary>
@@ -63,18 +63,19 @@ namespace MICore
     /// </summary>
     public sealed class PipeLaunchOptions : LaunchOptions
     {
-        public PipeLaunchOptions(string PipePath, string PipeArguments)
+        public PipeLaunchOptions(string PipePath, string PipeArguments, string PipeCommandArguments)
         {
             if (string.IsNullOrEmpty(PipePath))
                 throw new ArgumentNullException("PipePath");
 
             this.PipePath = PipePath;
             this.PipeArguments = PipeArguments;
+            this.PipeCommandArguments = PipeCommandArguments;
         }
 
         static internal PipeLaunchOptions CreateFromXml(Xml.LaunchOptions.PipeLaunchOptions source)
         {
-            var options = new PipeLaunchOptions(RequireAttribute(source.PipePath, "PipePath"), source.PipeArguments);
+            var options = new PipeLaunchOptions(RequireAttribute(source.PipePath, "PipePath"), source.PipeArguments, source.PipeCommandArguments);
             options.InitializeCommonOptions(source);
 
             return options;
@@ -88,7 +89,13 @@ namespace MICore
         /// <summary>
         /// [Optional] Arguments to pass to the pipe executable.
         /// </summary>
+        /// 
         public string PipeArguments { get; private set; }
+
+        /// <summary>
+        /// [Optional] Arguments to pass to the PipePath program that include a format specifier ('{0}') for a custom command.
+        /// </summary>
+        public string PipeCommandArguments { get; private set; }
     }
 
     public sealed class TcpLaunchOptions : LaunchOptions
@@ -148,16 +155,18 @@ namespace MICore
     /// </summary>
     public sealed class LocalLaunchOptions : LaunchOptions
     {
+
+        private bool _useExternalConsole;
+
         private const int DefaultLaunchTimeout = 10 * 1000; // 10 seconds
 
-        public LocalLaunchOptions(string MIDebuggerPath, string MIDebuggerServerAddress, int processId, Xml.LaunchOptions.EnvironmentEntry[] environmentEntries)
+        public LocalLaunchOptions(string MIDebuggerPath, string MIDebuggerServerAddress, Xml.LaunchOptions.EnvironmentEntry[] environmentEntries)
         {
             if (string.IsNullOrEmpty(MIDebuggerPath))
                 throw new ArgumentNullException("MIDebuggerPath");
 
             this.MIDebuggerPath = MIDebuggerPath;
             this.MIDebuggerServerAddress = MIDebuggerServerAddress;
-            this.ProcessId = processId;
 
             List<EnvironmentEntry> environmentList = new List<EnvironmentEntry>();
             if (environmentEntries != null)
@@ -184,8 +193,16 @@ namespace MICore
                 {
                     FilterStdout = true;    // no pattern source specified, use stdout
                 }
-                ServerLaunchTimeout = source.ServerLaunchTimeoutSpecified ? source.ServerLaunchTimeout : DefaultLaunchTimeout; 
+                ServerLaunchTimeout = source.ServerLaunchTimeoutSpecified ? source.ServerLaunchTimeout : DefaultLaunchTimeout;
             }
+        }
+
+        /// <summary>
+        /// Checks that the path is valid, exists, and is rooted.
+        /// </summary>
+        private static bool CheckPath(string path)
+        {
+            return path.IndexOfAny(Path.GetInvalidPathChars()) < 0 && File.Exists(path) && Path.IsPathRooted(path);
         }
 
         public bool ShouldStartServer()
@@ -193,17 +210,73 @@ namespace MICore
             return !string.IsNullOrWhiteSpace(DebugServer);
         }
 
+        public bool IsValidMiDebuggerPath()
+        {
+            return File.Exists(MIDebuggerPath);
+        }
+
         static internal LocalLaunchOptions CreateFromXml(Xml.LaunchOptions.LocalLaunchOptions source)
         {
+            string miDebuggerPath = source.MIDebuggerPath;
+
+            // If no path to the debugger was specified, look for the proper binary in the user's $PATH
+            if (String.IsNullOrEmpty(miDebuggerPath))
+            {
+                string debuggerBinary = null;
+                switch (source.MIMode)
+                {
+                    case Xml.LaunchOptions.MIMode.gdb:
+                        debuggerBinary = "gdb";
+                        break;
+
+                    case Xml.LaunchOptions.MIMode.lldb:
+                        debuggerBinary = "lldb-mi";
+                        break;
+                }
+
+                if (!String.IsNullOrEmpty(debuggerBinary))
+                {
+                    miDebuggerPath = LocalLaunchOptions.ResolveFromPath(debuggerBinary);
+                }
+
+                if (String.IsNullOrEmpty(miDebuggerPath))
+                {
+                    throw new InvalidLaunchOptionsException(MICoreResources.Error_NoMiDebuggerPath);
+                }
+            }
+
             var options = new LocalLaunchOptions(
-                RequireAttribute(source.MIDebuggerPath, "MIDebuggerPath"),
+                RequireAttribute(miDebuggerPath, "MIDebuggerPath"),
                 source.MIDebuggerServerAddress,
-                source.ProcessId,
                 source.Environment);
             options.InitializeCommonOptions(source);
             options.InitializeServerOptions(source);
+            options._useExternalConsole = source.ExternalConsole;
+
+            // when using local options the core dump path must check out
+            if (options.IsCoreDump && !LocalLaunchOptions.CheckPath(options.CoreDumpPath))
+                throw new ArgumentException(String.Format(CultureInfo.CurrentCulture, MICoreResources.Error_InvalidLocalExePath, options.CoreDumpPath));
 
             return options;
+        }
+
+        private static string ResolveFromPath(string command)
+        {
+            string pathVar = System.Environment.GetEnvironmentVariable("PATH");
+
+            // Check each portion of the PATH environment variable to see if it contains the requested file
+            foreach (string pathPart in pathVar.Split(Path.PathSeparator))
+            {
+                string candidate = Path.Combine(pathPart, command);
+
+                // If the file exists, use it
+                if (File.Exists(candidate))
+                {
+                    return candidate;
+                }
+            }
+
+            return null;
         }
 
         /// <summary>
@@ -215,29 +288,6 @@ namespace MICore
         /// [Optional] Server address that MI Debugger server is listening to
         /// </summary>
         public string MIDebuggerServerAddress { get; private set; }
-
-        /// <summary>
-        /// [Optional] If supplied, the debugger will attach to the process rather than launching a new one. Note that some operating systems will require admin rights to do this.
-        /// </summary>
-        public int ProcessId { get; private set; }
-
-        /// <summary>
-        /// [Required] Path to the executable file. This path must exist on the Visual Studio computer.
-        /// </summary>
-        public override string ExePath
-        {
-            get
-            {
-                return base.ExePath;
-            }
-            set
-            {
-                if (string.IsNullOrWhiteSpace(value) || value.IndexOfAny(Path.GetInvalidPathChars()) >= 0 || !File.Exists(value) || !Path.IsPathRooted(value))
-                    throw new ArgumentException(string.Format(CultureInfo.CurrentCulture, MICoreResources.Error_InvalidLocalExePath, value));
-
-                base.ExePath = value;
-            }
-        }
 
         /// <summary>
         /// [Optional] List of environment variables to add to the launched process
@@ -273,6 +323,11 @@ namespace MICore
         /// [Optional] Log strings written to stderr and examine for server started pattern
         /// </summary>
         public int ServerLaunchTimeout { get; private set; }
+
+        public bool UseExternalConsole
+        {
+            get { return _useExternalConsole; }
+        }
     }
 
     public sealed class SourceRoot
@@ -331,7 +386,25 @@ namespace MICore
 
         public MIMode DebuggerMIMode { get; set; }
 
+        private Xml.LaunchOptions.BaseLaunchOptions _baseOptions;
+        /// <summary>
+        /// Hold on to options in serializable form to support child process debugging
+        /// </summary>
+        public Xml.LaunchOptions.BaseLaunchOptions BaseOptions
+        {
+            get { return _baseOptions; }
+            protected set
+            {
+                if (value == null)
+                    throw new ArgumentNullException("BaseOptions");
+                VerifyCanModifyProperty("BaseOptions");
+
+                _baseOptions = value;
+            }
+        }
+
         private string _exePath;
+
         /// <summary>
         /// [Required] Path to the executable file. This could be a path on the remote machine (for Pipe transport)
         /// or the local machine (Local transport).
@@ -363,6 +436,44 @@ namespace MICore
             }
         }
 
+        private int _processId;
+
+        /// <summary>
+        /// [Optional] If supplied, the debugger will attach to the process rather than launching a new one. Note that some operating systems will require admin rights to do this.
+        /// </summary>
+        public int ProcessId
+        {
+            get { return _processId; }
+            protected set
+            {
+                VerifyCanModifyProperty("ProcessId");
+                _processId = value;
+            }
+        }
+
+        private string _coreDumpPath;
+        /// <summary>
+        /// [Optional] Path to a core dump file for the specified executable.
+        /// </summary>
+        public string CoreDumpPath
+        {
+            get
+            {
+                return _coreDumpPath;
+            }
+            protected set
+            {
+                VerifyCanModifyProperty("CoreDumpPath");
+
+                // CoreDumpPath is allowed to be null/empty
+                _coreDumpPath = value;
+            }
+        }
+        public bool IsCoreDump
+        {
+            get { return !String.IsNullOrEmpty(this.CoreDumpPath); }
+        }
+
         private string _workingDirectory;
         /// <summary>
         /// [Optional] Working directory to use for the MI Debugger when launching the process
@@ -374,6 +485,20 @@ namespace MICore
             {
                 VerifyCanModifyProperty("WorkingDirectory");
                 _workingDirectory = value;
+            }
+        }
+
+        private string _absolutePrefixSoLibSearchPath;
+        /// <summary>
+        /// [Optional] Absolute prefix for directories to search for shared library symbols
+        /// </summary>
+        public string AbsolutePrefixSOLibSearchPath
+        {
+            get { return _absolutePrefixSoLibSearchPath; }
+            set
+            {
+                VerifyCanModifyProperty("AbsolutePrefixSOLibSearchPath");
+                _absolutePrefixSoLibSearchPath = value;
             }
         }
 
@@ -405,6 +530,20 @@ namespace MICore
             }
         }
 
+        private bool _waitDynamicLibLoad = true;
+        /// <summary>
+        /// If true, wait for dynamic library load to finish.
+        /// </summary>
+        public bool WaitDynamicLibLoad
+        {
+            get { return _waitDynamicLibLoad; }
+            set
+            {
+                VerifyCanModifyProperty("WaitDynamicLibLoad");
+                _waitDynamicLibLoad = value;
+            }
+        }
+
         /// <summary>
         /// If true, instead of showing Natvis-DisplayString value as a child of a dummy element, it is shown immediately.
         /// Should only be enabled if debugger is fast enough providing the value.
@@ -431,7 +570,7 @@ namespace MICore
             {
                 if (this is LocalLaunchOptions)
                 {
-                    return !RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
+                    return !PlatformUtilities.IsWindows();
                 }
                 else
                 {
@@ -489,7 +628,61 @@ namespace MICore
             }
         }
 
+        private bool _debugChildProcesses;
+
+        public bool DebugChildProcesses
+        {
+            get { return _debugChildProcesses; }
+            protected set
+            {
+                VerifyCanModifyProperty("DebugChildProcesses");
+                _debugChildProcesses = value;
+            }
+        }
+
+        public string GetOptionsString()
+        {
+            try
+            {
+                var strWriter = new StringWriter(CultureInfo.InvariantCulture);
+                XmlSerializer serializer;
+                using (XmlWriter writer = XmlWriter.Create(strWriter))
+                {
+                    if (BaseOptions is Xml.LaunchOptions.LocalLaunchOptions)
+                    {
+                        serializer = new XmlSerializer(typeof(Xml.LaunchOptions.LocalLaunchOptions));
+                        Serialize(serializer, writer, BaseOptions);
+                    }
+                    else if (BaseOptions is Xml.LaunchOptions.PipeLaunchOptions)
+                    {
+                        serializer = new XmlSerializer(typeof(Xml.LaunchOptions.PipeLaunchOptions));
+                        Serialize(serializer, writer, BaseOptions);
+                    }
+                    else if (BaseOptions is Xml.LaunchOptions.TcpLaunchOptions)
+                    {
+                        serializer = new XmlSerializer(typeof(Xml.LaunchOptions.TcpLaunchOptions));
+                        Serialize(serializer, writer, BaseOptions);
+                    }
+                    else
+                    {
+                        throw new XmlException(MICoreResources.Error_UnknownLaunchOptions);
+                    }
+                }
+                return strWriter.ToString();
+            }
+            catch (Exception e)
+            {
+                throw new InvalidLaunchOptionsException(e.Message);
+            }
+        }
+
+        // Kofe debugger depends on this method to generate LaunchOptions
         public static LaunchOptions GetInstance(HostConfigurationStore configStore, string exePath, string args, string dir, string options, IDeviceAppLauncherEventCallback eventCallback, TargetEngine targetEngine)
+        {
+            return GetInstance(configStore, exePath, args, dir, options, eventCallback, targetEngine, null);
+        }
+
+        public static LaunchOptions GetInstance(HostConfigurationStore configStore, string exePath, string args, string dir, string options, IDeviceAppLauncherEventCallback eventCallback, TargetEngine targetEngine, Logger logger)
         {
             if (string.IsNullOrWhiteSpace(exePath))
                 throw new ArgumentNullException("exePath");
@@ -497,7 +690,7 @@ namespace MICore
             if (string.IsNullOrWhiteSpace(options))
                 throw new InvalidLaunchOptionsException(MICoreResources.Error_StringIsNullOrEmpty);
 
-            Logger.WriteTextBlock("LaunchOptions", options);
+            logger?.WriteTextBlock("LaunchOptions", options);
 
             LaunchOptions launchOptions = null;
             Guid clsidLauncher = Guid.Empty;
@@ -515,6 +708,7 @@ namespace MICore
                                 serializer = GetXmlSerializer(typeof(Xml.LaunchOptions.LocalLaunchOptions));
                                 var xmlLaunchOptions = (Xml.LaunchOptions.LocalLaunchOptions)Deserialize(serializer, reader);
                                 launchOptions = LocalLaunchOptions.CreateFromXml(xmlLaunchOptions);
+                                launchOptions.BaseOptions = xmlLaunchOptions;
                             }
                             break;
 
@@ -523,6 +717,7 @@ namespace MICore
                                 serializer = GetXmlSerializer(typeof(Xml.LaunchOptions.PipeLaunchOptions));
                                 var xmlLaunchOptions = (Xml.LaunchOptions.PipeLaunchOptions)Deserialize(serializer, reader);
                                 launchOptions = PipeLaunchOptions.CreateFromXml(xmlLaunchOptions);
+                                launchOptions.BaseOptions = xmlLaunchOptions;
                             }
                             break;
 
@@ -531,6 +726,7 @@ namespace MICore
                                 serializer = GetXmlSerializer(typeof(Xml.LaunchOptions.TcpLaunchOptions));
                                 var xmlLaunchOptions = (Xml.LaunchOptions.TcpLaunchOptions)Deserialize(serializer, reader);
                                 launchOptions = TcpLaunchOptions.CreateFromXml(xmlLaunchOptions);
+                                launchOptions.BaseOptions = xmlLaunchOptions;
                             }
                             break;
 
@@ -568,7 +764,7 @@ namespace MICore
 
             if (clsidLauncher != Guid.Empty)
             {
-                launchOptions = ExecuteLauncher(configStore, clsidLauncher, exePath, args, dir, launcherXmlOptions, eventCallback, targetEngine);
+                launchOptions = ExecuteLauncher(configStore, clsidLauncher, exePath, args, dir, launcherXmlOptions, eventCallback, targetEngine, logger);
             }
 
             if (targetEngine == TargetEngine.Native)
@@ -668,6 +864,22 @@ namespace MICore
             }
         }
 
+        private static void Serialize(XmlSerializer serializer, XmlWriter writer, object o)
+        {
+            try
+            {
+                serializer.Serialize(writer, o);
+            }
+            catch (InvalidOperationException outerException)
+            {
+                // In all the cases I have seen thus far, the InvalidOperationException has a fairly useless message
+                // and the inner exception message is better.
+                Exception e = outerException.InnerException ?? outerException;
+
+                throw new InvalidLaunchOptionsException(e.Message);
+            }
+        }
+
         public IEnumerable<string> GetSOLibSearchPath()
         {
             IEqualityComparer<string> comparer = this.UseUnixSymbolPaths ? StringComparer.Ordinal : StringComparer.OrdinalIgnoreCase;
@@ -725,7 +937,7 @@ namespace MICore
                 }
             }
 
-            if (this.TargetArchitecture == TargetArchitecture.Unknown)
+            if (this.TargetArchitecture == TargetArchitecture.Unknown && source.TargetArchitectureSpecified)
             {
                 this.TargetArchitecture = ConvertTargetArchitectureAttribute(source.TargetArchitecture);
             }
@@ -745,6 +957,7 @@ namespace MICore
                 this.VisualizerFile = source.VisualizerFile;
 
             this.ShowDisplayString = source.ShowDisplayString;
+            this.WaitDynamicLibLoad = source.WaitDynamicLibLoad;
 
             this.SetupCommands = LaunchCommand.CreateCollectionFromXml(source.SetupCommands);
 
@@ -766,6 +979,20 @@ namespace MICore
                 else
                     this.AdditionalSOLibSearchPath = string.Concat(this.AdditionalSOLibSearchPath, ";", additionalSOLibSearchPath);
             }
+            if (string.IsNullOrEmpty(this.AbsolutePrefixSOLibSearchPath))
+                this.AbsolutePrefixSOLibSearchPath = source.AbsolutePrefixSOLibSearchPath;
+
+            if (source.DebugChildProcessesSpecified)
+            {
+                this.DebugChildProcesses = source.DebugChildProcesses;
+            }
+
+            this.ProcessId = source.ProcessId;
+            this.CoreDumpPath = source.CoreDumpPath;
+
+            // Ensure that CoreDumpPath and ProcessId are not specified at the same time
+            if (!String.IsNullOrEmpty(source.CoreDumpPath) && source.ProcessIdSpecified)
+                throw new InvalidLaunchOptionsException(String.Format(CultureInfo.InvariantCulture, MICoreResources.Error_CannotSpecifyBoth, nameof(source.CoreDumpPath), nameof(source.ProcessId)));
         }
 
         public static string RequireAttribute(string attributeValue, string attributeName)
@@ -786,7 +1013,7 @@ namespace MICore
             return attributeValue;
         }
 
-        private static LaunchOptions ExecuteLauncher(HostConfigurationStore configStore, Guid clsidLauncher, string exePath, string args, string dir, object launcherXmlOptions, IDeviceAppLauncherEventCallback eventCallback, TargetEngine targetEngine)
+        private static LaunchOptions ExecuteLauncher(HostConfigurationStore configStore, Guid clsidLauncher, string exePath, string args, string dir, object launcherXmlOptions, IDeviceAppLauncherEventCallback eventCallback, TargetEngine targetEngine, Logger logger)
         {
             var deviceAppLauncher = (IPlatformAppLauncher)HostLoader.VsCoCreateManagedObject(configStore, clsidLauncher);
             if (deviceAppLauncher == null)
@@ -803,7 +1030,7 @@ namespace MICore
                     deviceAppLauncher.Initialize(configStore, eventCallback);
                     deviceAppLauncher.SetLaunchOptions(exePath, args, dir, launcherXmlOptions, targetEngine);
                 }
-                catch (Exception e) when (!(e is InvalidLaunchOptionsException) && ExceptionHelper.BeforeCatch(e, reportOnlyCorrupting:true))
+                catch (Exception e) when (!(e is InvalidLaunchOptionsException) && ExceptionHelper.BeforeCatch(e, logger, reportOnlyCorrupting: true))
                 {
                     throw new InvalidLaunchOptionsException(e.Message);
                 }

@@ -23,6 +23,9 @@ namespace MICore
         private ManualResetEvent _allReadersDone = new ManualResetEvent(false);
         private bool _killOnClose;
         private bool _filterStderr;
+        private int _debuggerPid = -1;
+        private string _pipePath;
+        private string _cmdArgs;
 
         public PipeTransport(bool killOnClose = false, bool filterStderr = false, bool filterStdout = false) : base(filterStdout)
         {
@@ -30,9 +33,58 @@ namespace MICore
             _filterStderr = filterStderr;
         }
 
+        public bool Interrupt(int pid)
+        {
+            if (_cmdArgs == null)
+            {
+                return false;
+            }
+
+            try
+            {
+                Process proc = new Process();
+                string killCmd = string.Format(CultureInfo.InvariantCulture, "kill -2 {0}", pid);
+                proc.StartInfo.FileName = _pipePath;
+                proc.StartInfo.Arguments = string.Format(CultureInfo.InvariantCulture, _cmdArgs, killCmd);
+                proc.StartInfo.WorkingDirectory = System.IO.Path.GetDirectoryName(_pipePath);
+                proc.EnableRaisingEvents = false;
+                proc.StartInfo.RedirectStandardInput = false;
+                proc.StartInfo.RedirectStandardOutput = true;
+                proc.StartInfo.RedirectStandardError = true;
+                proc.StartInfo.UseShellExecute = false;
+                proc.StartInfo.CreateNoWindow = true;
+                proc.Start();
+                AsyncReadFromStream(proc.StandardOutput, (s) => { if (!string.IsNullOrWhiteSpace(s)) this.Callback.OnStdOutLine(s); });
+                AsyncReadFromStream(proc.StandardError, (s) => { if (!string.IsNullOrWhiteSpace(s)) this.Callback.OnStdErrorLine(s); });
+                proc.WaitForExit();
+                if (proc.ExitCode != 0)
+                {
+                    this.Callback.OnStdErrorLine(string.Format(CultureInfo.InvariantCulture, MICoreResources.Warn_ProcessExit, _pipePath, proc.ExitCode));
+                }
+            }
+            catch (Exception e)
+            {
+                this.Callback.OnStdErrorLine(string.Format(CultureInfo.InvariantCulture, MICoreResources.Warn_ProcessException, _pipePath, e.Message));
+                return false;
+            }
+            return true;
+        }
+
         protected override string GetThreadName()
         {
             return "MI.PipeTransport";
+        }
+
+        /// <summary>
+        /// The value of this property reflects the pid for the debugger running
+        /// locally.
+        /// </summary>
+        public override int DebuggerPid
+        {
+            get
+            {
+                return _debuggerPid;
+            }
         }
 
         protected virtual void InitProcess(Process proc, out StreamReader stdout, out StreamWriter stdin)
@@ -53,6 +105,7 @@ namespace MICore
                 this.Callback.AppendToInitializationLog(string.Format(CultureInfo.InvariantCulture, "Starting: \"{0}\" {1}", _process.StartInfo.FileName, _process.StartInfo.Arguments));
                 _process.Start();
 
+                _debuggerPid = _process.Id;
                 stdout = _process.StandardOutput;
                 stdin = _process.StandardInput;
                 _stdErrReader = _process.StandardError;
@@ -62,12 +115,14 @@ namespace MICore
             }
         }
 
-
         public override void InitStreams(LaunchOptions options, out StreamReader reader, out StreamWriter writer)
         {
             PipeLaunchOptions pipeOptions = (PipeLaunchOptions)options;
 
+            _cmdArgs = pipeOptions.PipeCommandArguments;
+
             Process proc = new Process();
+            _pipePath = pipeOptions.PipePath;
             proc.StartInfo.FileName = pipeOptions.PipePath;
             proc.StartInfo.Arguments = pipeOptions.PipeArguments;
             proc.StartInfo.WorkingDirectory = System.IO.Path.GetDirectoryName(pipeOptions.PipePath);
@@ -90,8 +145,8 @@ namespace MICore
 
         private void KillProcess(Process p)
         {
-            bool isLinux = RuntimeInformation.IsOSPlatform(OSPlatform.Linux);
-            bool isOSX = RuntimeInformation.IsOSPlatform(OSPlatform.OSX);
+            bool isLinux = PlatformUtilities.IsLinux();
+            bool isOSX = PlatformUtilities.IsOSX();
             if (isLinux || isOSX)
             {
                 // On linux run 'ps -x -o "%p %P"' (similarly on Mac), which generates a list of the process ids (%p) and parent process ids (%P).
@@ -184,6 +239,25 @@ namespace MICore
             }
 
             base.OnReadStreamAborted();
+        }
+
+        private async void AsyncReadFromStream(StreamReader stream, Action<string> lineHandler)
+        {
+            try
+            {
+                while (true)
+                {
+                    string line = await stream.ReadLineAsync();
+                    if (line == null)
+                        break;
+
+                    lineHandler(line);
+                }
+            }
+            catch (Exception)
+            {
+                // If anything goes wrong, don't crash VS
+            }
         }
 
         private async void AsyncReadFromStdError()

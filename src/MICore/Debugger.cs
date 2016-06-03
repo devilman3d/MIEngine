@@ -6,11 +6,10 @@ using System.Collections.Generic;
 using System.Threading;
 using System.Text;
 using System.Diagnostics;
-using System.Collections;
 using System.Threading.Tasks;
 using System.Globalization;
 using System.Linq;
-using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
 
 namespace MICore
 {
@@ -35,12 +34,19 @@ namespace MICore
         public event EventHandler ModuleLoadEvent;  // occurs when stopped after a libraryLoadEvent
         public event EventHandler LibraryLoadEvent; // a shared library was loaded
         public event EventHandler BreakChangeEvent; // a breakpoint was changed
+        public event EventHandler BreakCreatedEvent; // a breakpoint was created
         public event EventHandler ThreadCreatedEvent;
         public event EventHandler ThreadExitedEvent;
+        public event EventHandler ThreadGroupExitedEvent;
         public event EventHandler<ResultEventArgs> MessageEvent;
         public event EventHandler<ResultEventArgs> TelemetryEvent;
         private int _exiting;
         public ProcessState ProcessState { get; private set; }
+        private MIResults _miResults;
+
+        public bool EntrypointHit { get; protected set; }
+
+        public bool IsCygwin { get; protected set; }
 
         public virtual void FlushBreakStateData()
         {
@@ -58,15 +64,18 @@ namespace MICore
         public bool Is64BitArch { get; private set; }
         public CommandLock CommandLock { get { return _commandLock; } }
         public MICommandFactory MICommandFactory { get; protected set; }
+        public Logger Logger { private set; get; }
 
         [System.Diagnostics.CodeAnalysis.SuppressMessage("Microsoft.Security", "CA2104:DoNotDeclareReadOnlyMutableReferenceTypes")]
         protected readonly LaunchOptions _launchOptions;
+        public LaunchOptions LaunchOptions { get { return this._launchOptions; } }
 
         private Queue<Func<Task>> _internalBreakActions = new Queue<Func<Task>>();
         private TaskCompletionSource<object> _internalBreakActionCompletionSource;
         private TaskCompletionSource<object> _consoleDebuggerInitializeCompletionSource = new TaskCompletionSource<object>();
         private LinkedList<string> _initializationLog = new LinkedList<string>();
         private LinkedList<string> _initialErrors = new LinkedList<string>();
+        private int _localDebuggerPid = -1;
 
         protected bool _connected;
 
@@ -86,10 +95,21 @@ namespace MICore
             public uint Id { get; private set; }
         };
 
+        public class StoppingEventArgs: ResultEventArgs
+        {
+            public readonly BreakRequest AsyncRequest;
+            public StoppingEventArgs(Results results, uint id, BreakRequest asyncRequest = BreakRequest.None) : base(results, id)
+            {
+                AsyncRequest = asyncRequest;
+            }
+
+            public StoppingEventArgs(Results results, BreakRequest asyncRequest = BreakRequest.None) : this(results, 0, asyncRequest)
+            { }
+        }
+
         private ITransport _transport;
         private CommandLock _commandLock = new CommandLock();
 
-        private string _lastResult;
         /// <summary>
         /// The last command we sent over the transport. This includes both the command name and arguments.
         /// </summary>
@@ -103,6 +123,14 @@ namespace MICore
         private StringBuilder _consoleCommandOutput;
 
         private bool _pendingInternalBreak;
+        internal bool IsRequestingInternalAsyncBreak
+        {
+            get
+            {
+                return _pendingInternalBreak;
+            }
+        }
+
         private bool _waitingToStop;
         private Timer _breakTimer = null;
         private int _retryCount;
@@ -112,10 +140,38 @@ namespace MICore
         // The key is the thread group, the value is the pid
         private Dictionary<string, int> _debuggeePids;
 
-        public Debugger(LaunchOptions launchOptions)
+        public Debugger(LaunchOptions launchOptions, Logger logger)
         {
             _launchOptions = launchOptions;
             _debuggeePids = new Dictionary<string, int>();
+            Logger = logger;
+            _miResults = new MIResults(logger);
+        }
+
+        protected void SetDebuggerPid(int debuggerPid)
+        {
+            // Used for testing
+            Logger.WriteLine(string.Concat("DebuggerPid=", debuggerPid));
+            _localDebuggerPid = debuggerPid;
+        }
+
+        /// <summary>
+        /// Check if the local debugger process is running.
+        /// For Windows, it returns False always to avoid shortcuts taken when it returns True.
+        /// </summary>
+        /// <returns>True if the local debugger process is running and the platform is Linux or OS X.
+        /// False otherwise.</returns>
+        private bool IsUnixDebuggerRunning()
+        {
+            if (_localDebuggerPid > 0)
+            {
+                if (PlatformUtilities.IsLinux() || PlatformUtilities.IsOSX())
+                {
+                    return UnixUtilities.IsProcessRunning(_localDebuggerPid);
+                }
+            }
+
+            return false;
         }
 
         private void RetryBreak(object o)
@@ -125,7 +181,7 @@ namespace MICore
                 if (_waitingToStop && _retryCount < BREAK_RETRY_MAX)
                 {
                     Logger.WriteLine("Debugger failed to break. Trying again.");
-                    CmdBreakInternal();
+                    CmdBreak(BreakRequest.Internal);
                     _retryCount++;
                 }
                 else
@@ -158,10 +214,17 @@ namespace MICore
                     if (!_pendingInternalBreak)
                     {
                         _pendingInternalBreak = true;
-                        CmdBreakInternal();
+                        CmdBreak(BreakRequest.Internal);
                         _retryCount = 0;
                         _waitingToStop = true;
-                        _breakTimer = new Timer(RetryBreak, null, BREAK_DELTA, BREAK_DELTA);
+
+                        // When using signals to stop the proces, do not kick off another break attempt. The debug break injection and
+                        // signal based models are reliable so no retries are needed. Cygwin can't currently async-break reliably, so
+                        // use retries there.
+                        if (!IsLocalGdb() && !this.IsCygwin)
+                        {
+                            _breakTimer = new Timer(RetryBreak, null, BREAK_DELTA, BREAK_DELTA);
+                        }
                     }
                     return _internalBreakActionCompletionSource.Task;
                 }
@@ -172,41 +235,31 @@ namespace MICore
         {
             string reason = results.TryFindString("reason");
 
-            if (reason.StartsWith("exited"))
+            if (reason.StartsWith("exited") || reason.StartsWith("disconnected"))
             {
-                string threadGroupId = results.TryFindString("id");
-                if (!String.IsNullOrEmpty(threadGroupId))
+                if (this.ProcessState != ProcessState.Exited)
                 {
-                    lock (_debuggeePids)
+                    this.ProcessState = ProcessState.Exited;
+                    if (ProcessExitEvent != null)
                     {
-                        _debuggeePids.Remove(threadGroupId);
+                        ProcessExitEvent(this, new ResultEventArgs(results));
                     }
-                }
-
-                if (IsLocalGdbAttach())
-                {
-                    CmdExitAsync();
-                }
-
-                this.ProcessState = ProcessState.Exited;
-                if (ProcessExitEvent != null)
-                {
-                    ProcessExitEvent(this, new ResultEventArgs(results));
                 }
                 return;
             }
 
             //if this is an exception reported from LLDB, it will not currently contain a frame object in the MI
-            //if we don't have a frame, check if this is an excpetion and retrieve the frame
+            //if we don't have a frame, check if this is an exception and retrieve the frame
             if (!results.Contains("frame") &&
-                string.Compare(reason, "exception-received", StringComparison.OrdinalIgnoreCase) == 0
+                (string.Compare(reason, "exception-received", StringComparison.OrdinalIgnoreCase) == 0 ||
+                string.Compare(reason, "signal-received", StringComparison.OrdinalIgnoreCase) == 0)
                 )
             {
                 //get the info for the current frame
                 Results frameResult = await MICommandFactory.StackInfoFrame();
 
                 //add the frame to the stopping results
-                results.Add("frame", frameResult.Find("frame"));
+                results = results.Add("frame", frameResult.Find("frame"));
             }
 
             bool fIsAsyncBreak = MICommandFactory.IsAsyncBreakSignal(results);
@@ -227,15 +280,19 @@ namespace MICore
             }
             else if (BreakModeEvent != null)
             {
-                if (fIsAsyncBreak) { _requestingRealAsyncBreak = false; }
-                BreakModeEvent(this, new ResultEventArgs(results));
+                BreakRequest request = _requestingRealAsyncBreak;
+                _requestingRealAsyncBreak = BreakRequest.None;
+                BreakModeEvent(this, new StoppingEventArgs(results, request));
             }
         }
 
         protected virtual void OnStateChanged(string mode, string strresult)
         {
-            Results results = MIResults.ParseResultList(strresult);
+            this.OnStateChanged(mode, _miResults.ParseResultList(strresult));
+        }
 
+        protected void OnStateChanged(string mode, Results results)
+        {
             if (mode == "stopped")
             {
                 OnStopped(results);
@@ -306,7 +363,7 @@ namespace MICore
                 {
                     await item();
                 }
-                catch (Exception e) when (ExceptionHelper.BeforeCatch(e, reportOnlyCorrupting:true))
+                catch (Exception e) when (ExceptionHelper.BeforeCatch(e, Logger, reportOnlyCorrupting: true))
                 {
                     if (firstException != null)
                     {
@@ -324,7 +381,7 @@ namespace MICore
                 }
                 else
                 {
-                    if (!_requestingRealAsyncBreak && fIsAsyncBreak)
+                    if (_requestingRealAsyncBreak == BreakRequest.Internal && fIsAsyncBreak)
                     {
                         CmdContinueAsync();
                         processContinued = true;
@@ -350,9 +407,12 @@ namespace MICore
             _transport = transport;
             FlushBreakStateData();
 
-            _transport.Init(this, options);
+            _transport.Init(this, options, Logger);
+        }
 
-            switch (options.TargetArchitecture)
+        public void SetTargetArch(TargetArchitecture arch)
+        {
+            switch (arch)
             {
                 case TargetArchitecture.ARM:
                     MaxInstructionSize = 4;
@@ -439,27 +499,48 @@ namespace MICore
 
         public Task CmdStopAtMain()
         {
+            this.VerifyNotDebuggingCoreDump();
+
             return CmdAsync("-break-insert main", ResultClass.done);
         }
 
         public Task CmdStart()
         {
+            this.VerifyNotDebuggingCoreDump();
+
             return CmdAsync("-exec-run", ResultClass.running);
         }
 
-        protected bool _requestingRealAsyncBreak = false;
-        public Task CmdBreak()
+        internal bool IsRequestingRealAsyncBreak
         {
-            _requestingRealAsyncBreak = true;
+            get
+            {
+                return _requestingRealAsyncBreak != BreakRequest.None;
+            }
+        }
+
+        public enum BreakRequest    // order is important so a stop request doesn't get overridden by an internal request
+        {
+            None,
+            Internal,
+            Async,
+            Stop
+        }
+        protected BreakRequest _requestingRealAsyncBreak = BreakRequest.None;
+        public Task CmdBreak(BreakRequest request)
+        {
+            if (request > _requestingRealAsyncBreak)
+            {
+                _requestingRealAsyncBreak = request;
+            }
             return CmdBreakInternal();
         }
 
 
-        private bool IsLocalGdbAttach()
+        internal bool IsLocalGdb()
         {
             if (this.MICommandFactory.Mode == MIMode.Gdb &&
                this._launchOptions is LocalLaunchOptions &&
-               ((LocalLaunchOptions)this._launchOptions).ProcessId != 0 &&
                String.IsNullOrEmpty(((LocalLaunchOptions)this._launchOptions).MIDebuggerServerAddress)
                )
             {
@@ -471,27 +552,56 @@ namespace MICore
             }
         }
 
+        private bool IsRemoteGdb()
+        {
+            return this.MICommandFactory.Mode == MIMode.Gdb &&
+               this._launchOptions is PipeLaunchOptions;
+        }
+
+        protected bool IsCoreDump
+        {
+            get
+            {
+                LocalLaunchOptions localOptions = this._launchOptions as LocalLaunchOptions;
+                if (null == localOptions)
+                    return false;
+
+                return localOptions.IsCoreDump;
+            }
+        }
+
         public async Task<Results> CmdTerminate()
         {
+            if (ProcessState == ProcessState.Running)
+            {
+                await CmdBreak(BreakRequest.Async);
+            }
+
             await MICommandFactory.Terminate();
 
-            if (IsLocalGdbAttach())
+            return new Results(ResultClass.done);
+        }
+
+        public async Task<Results> CmdDetach()
+        {
+            if (ProcessState == ProcessState.Running)
             {
-                CmdExitAsync();
+                await CmdBreak(BreakRequest.Async);
             }
+            await CmdAsync("-target-detach", ResultClass.done);
 
             return new Results(ResultClass.done);
         }
 
         public Task CmdBreakInternal()
         {
-            //TODO May need to fix attach on windows and osx.
-            if (IsLocalGdbAttach() && RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
+            this.VerifyNotDebuggingCoreDump();
+            Debug.Assert(_requestingRealAsyncBreak != BreakRequest.None);
+
+            // Note that interrupt doesn't work on OS X with gdb:
+            // https://sourceware.org/bugzilla/show_bug.cgi?id=20035
+            if (IsLocalGdb())
             {
-                // for local linux debugging with attach, send a signal to one of the debugee processes rather than 
-                // using -exec-interrupt. -exec-interrupt does not work with attach. End result is either
-                // deadlocks or missed bps (since binding in runtime requires break state). 
-                // NOTE: this is not required for remote. Remote will not be using LocalLinuxTransport
                 bool useSignal = false;
                 int debuggeePid = 0;
                 lock (_debuggeePids)
@@ -503,9 +613,24 @@ namespace MICore
                     }
                 }
 
-                if (useSignal)
+                if (PlatformUtilities.IsLinux() || PlatformUtilities.IsOSX())
                 {
-                    return CmdLinuxBreak(debuggeePid, ResultClass.done);
+                    // for local linux debugging, send a signal to one of the debuggee processes rather than
+                    // using -exec-interrupt. -exec-interrupt does not work with attach and, in some instances, launch. 
+                    // End result is either deadlocks or missed bps (since binding in runtime requires break state).
+                    // NOTE: this is not required for remote. Remote will not be using LocalLinuxTransport
+                    if (useSignal)
+                    {
+                        return CmdBreakUnix(debuggeePid, ResultClass.done);
+                    }
+                }
+            }
+            else if (IsRemoteGdb() && _transport is PipeTransport)
+            {
+                int pid = PidByInferior("i1");
+                if (pid != 0 && ((PipeTransport)_transport).Interrupt(pid))
+                {
+                    return Task.FromResult<Results>(new Results(ResultClass.done));
                 }
             }
 
@@ -521,6 +646,7 @@ namespace MICore
 
         public void CmdContinueAsync()
         {
+            this.VerifyNotDebuggingCoreDump();
             PostCommand("-exec-continue");
         }
 
@@ -551,7 +677,7 @@ namespace MICore
             return outStr.ToString();
         }
 
-        public async Task<string> ConsoleCmdAsync(string cmd)
+        public async Task<string> ConsoleCmdAsync(string cmd, bool ignoreFailures = false)
         {
             if (this.ProcessState != ProcessState.Stopped && this.ProcessState != ProcessState.NotConnected)
             {
@@ -585,7 +711,7 @@ namespace MICore
 
                 try
                 {
-                    await ExclusiveCmdAsync("-interpreter-exec console \"" + Escape(cmd) + "\"", ResultClass.done, lockToken);
+                    await ExclusiveCmdAsync("-interpreter-exec console \"" + Escape(cmd) + "\"", ignoreFailures ? ResultClass.None : ResultClass.done, lockToken);
 
                     return _consoleCommandOutput.ToString();
                 }
@@ -642,18 +768,18 @@ namespace MICore
             return waitingOperation.Task;
         }
 
-        private Task<Results> CmdLinuxBreak(int debugeePid, ResultClass expectedResultClass)
+        private Task<Results> CmdBreakUnix(int debugeePid, ResultClass expectedResultClass)
         {
             // Send sigint to the debuggee process. This is the equivalent of hitting ctrl-c on the console.
             // This will cause gdb to async-break. This is necessary because gdb does not support async break
             // when attached.
             const int sigint = 2;
-            LinuxNativeMethods.Kill(debugeePid, sigint);
+            UnixNativeMethods.Kill(debugeePid, sigint);
 
             return Task.FromResult<Results>(new Results(ResultClass.done));
         }
 
-        #region ITransportCallback implementation
+#region ITransportCallback implementation
         // Note: this can be called from any thread
         void ITransportCallback.OnStdOutLine(string line)
         {
@@ -760,7 +886,7 @@ namespace MICore
             }
         }
 
-        #endregion
+#endregion
 
         // inherited classes can override this for thread marshalling etc
         protected virtual void ScheduleStdOutProcessing(string line)
@@ -886,7 +1012,7 @@ namespace MICore
                         }
                         if (waitingOperation != null)
                         {
-                            Results results = MIResults.ParseCommandOutput(noprefix);
+                            Results results = _miResults.ParseCommandOutput(noprefix);
                             Logger.WriteLine(id + ": elapsed time " + (int)(DateTime.Now - waitingOperation.StartTime).TotalMilliseconds);
                             waitingOperation.OnComplete(results, this.MICommandFactory);
                             return;
@@ -943,8 +1069,7 @@ namespace MICore
         private void OnResult(string cmd, string token)
         {
             uint id = token != null ? uint.Parse(token, CultureInfo.InvariantCulture) : 0;
-            _lastResult = cmd;
-            Results results = MIResults.ParseCommandOutput(cmd);
+            Results results = _miResults.ParseCommandOutput(cmd);
 
             if (results.ResultClass == ResultClass.done)
             {
@@ -968,7 +1093,7 @@ namespace MICore
 
         private void OnDebuggeeOutput(string cmd)
         {
-            string decodedOutput = MIResults.ParseCString(cmd);
+            string decodedOutput = _miResults.ParseCString(cmd);
 
             if (_consoleCommandOutput == null)
             {
@@ -999,7 +1124,7 @@ namespace MICore
             }
             else
             {
-                string decodedOutput = MIResults.ParseCString(cmd);
+                string decodedOutput = _miResults.ParseCString(cmd);
                 _consoleCommandOutput.Append(decodedOutput);
             }
         }
@@ -1008,12 +1133,32 @@ namespace MICore
         {
             if (cmd.StartsWith("stopped,", StringComparison.Ordinal))
             {
-                string status = MIResults.ParseCString(cmd.Substring(8));
+                string status = _miResults.ParseCString(cmd.Substring(8));
                 OnStateChanged("stopped", status);
+            }
+            else if (cmd.StartsWith("stopped", StringComparison.Ordinal))
+            {
+                if (PlatformUtilities.IsWindows() &&
+                    this.LaunchOptions is LocalLaunchOptions &&
+                    ((LocalLaunchOptions)this.LaunchOptions).ProcessId != 0 &&
+                    this.MICommandFactory.Mode == MIMode.Gdb &&
+                    !this.IsCygwin
+                    )
+                {
+                    // mingw enters break mode with no status flags on the mi response during attach.
+                    // In order to keey the entrypoint state correct, set it to true and continue
+                    // the break.
+                    this.EntrypointHit = true;
+                    CmdContinueAsync();
+                }
+                else
+                {
+                    Debug.Fail("Unknown out-of-band msg: " + cmd);
+                }
             }
             else if (cmd.StartsWith("running,", StringComparison.Ordinal))
             {
-                string status = MIResults.ParseCString(cmd.Substring(8));
+                string status = _miResults.ParseCString(cmd.Substring(8));
                 OnStateChanged("running", status);
             }
             else
@@ -1034,31 +1179,48 @@ namespace MICore
             }
             else if (cmd.StartsWith("breakpoint-modified,", StringComparison.Ordinal))
             {
-                results = MIResults.ParseResultList(cmd.Substring(20));
+                results = _miResults.ParseResultList(cmd.Substring(20));
                 if (BreakChangeEvent != null)
                 {
                     BreakChangeEvent(this, new ResultEventArgs(results));
                 }
             }
+            else if (cmd.StartsWith("breakpoint-created,", StringComparison.Ordinal))
+            {
+                results = _miResults.ParseResultList(cmd.Substring("breakpoint-created,".Length));
+                if (BreakCreatedEvent != null)
+                {
+                    BreakCreatedEvent(this, new ResultEventArgs(results));
+                }
+            }
             else if (cmd.StartsWith("thread-group-started,", StringComparison.Ordinal))
             {
-                results = MIResults.ParseResultList(cmd.Substring("thread-group-started,".Length));
+                results = _miResults.ParseResultList(cmd.Substring("thread-group-started,".Length));
                 HandleThreadGroupStarted(results);
+            }
+            else if (cmd.StartsWith("thread-group-exited,", StringComparison.Ordinal))
+            {
+                results = _miResults.ParseResultList(cmd.Substring("thread-group-exited,".Length));
+                HandleThreadGroupExited(results);
+                if (ThreadGroupExitedEvent != null)
+                {
+                    ThreadGroupExitedEvent(this, new ResultEventArgs(results, 0));
+                }
             }
             else if (cmd.StartsWith("thread-created,", StringComparison.Ordinal))
             {
-                results = MIResults.ParseResultList(cmd.Substring("thread-created,".Length));
+                results = _miResults.ParseResultList(cmd.Substring("thread-created,".Length));
                 ThreadCreatedEvent(this, new ResultEventArgs(results, 0));
             }
             else if (cmd.StartsWith("thread-exited,", StringComparison.Ordinal))
             {
-                results = MIResults.ParseResultList(cmd.Substring("thread-exited,".Length));
+                results = _miResults.ParseResultList(cmd.Substring("thread-exited,".Length));
                 ThreadExitedEvent(this, new ResultEventArgs(results, 0));
             }
             // NOTE: the message event is an MI Extension from clrdbg, though we could use in it the future for other debuggers
             else if (cmd.StartsWith("message,", StringComparison.Ordinal))
             {
-                results = MIResults.ParseResultList(cmd.Substring("message,".Length));
+                results = _miResults.ParseResultList(cmd.Substring("message,".Length));
                 if (this.MessageEvent != null)
                 {
                     this.MessageEvent(this, new ResultEventArgs(results));
@@ -1066,7 +1228,7 @@ namespace MICore
             }
             else if (cmd.StartsWith("telemetry,", StringComparison.Ordinal))
             {
-                results = MIResults.ParseResultList(cmd.Substring("telemetry,".Length));
+                results = _miResults.ParseResultList(cmd.Substring("telemetry,".Length));
                 if (this.TelemetryEvent != null)
                 {
                     this.TelemetryEvent(this, new ResultEventArgs(results));
@@ -1112,7 +1274,7 @@ namespace MICore
 
         private void HandleThreadGroupStarted(Results results)
         {
-            string idString = results.FindString("id");
+            string threadGroupId = results.FindString("id");
             string pidString = results.FindString("pid");
 
             int pid = Int32.Parse(pidString, CultureInfo.InvariantCulture);
@@ -1123,7 +1285,72 @@ namespace MICore
             {
                 lock (_debuggeePids)
                 {
-                    _debuggeePids.Add(idString, pid);
+                    _debuggeePids.Add(threadGroupId, pid);
+                }
+            }
+        }
+
+        public uint InferiorByPid(int pid)
+        {
+            foreach (var grp in _debuggeePids)
+            {
+                if ( grp.Value == pid)
+                {
+                    return InferiorNumber(grp.Key);
+                }
+            }
+            return 0;
+        }
+
+        public int PidByInferior(string inf)
+        {
+            if (_debuggeePids.ContainsKey(inf))
+            {
+                return _debuggeePids[inf];
+            }
+            return 0;
+        }
+
+        public uint InferiorNumber(string groupId)
+        {
+            // Inferior names are of the form "iX" where X in the inferior number
+            if (groupId.Length >= 2 && groupId[0] == 'i')
+            {
+                uint id;
+                if (UInt32.TryParse(groupId.Substring(1), out id))
+                {
+                    return id;
+                }
+            }
+            return 1;   // default to the first inferior if group-id not understood
+        }
+
+        private void HandleThreadGroupExited(Results results)
+        {
+            string threadGroupId = results.TryFindString("id");
+            bool isThreadGroupEmpty = false;
+
+            if (!String.IsNullOrEmpty(threadGroupId))
+            {
+                lock (_debuggeePids)
+                {
+                    if (_debuggeePids.Remove(threadGroupId))
+                    {
+                        isThreadGroupEmpty = _debuggeePids.Count == 0;
+                    }
+                }
+            }
+
+            if (isThreadGroupEmpty)
+            {
+                ScheduleStdOutProcessing(@"*stopped,reason=""exited""");
+
+                if (!IsUnixDebuggerRunning())
+                {
+                    // Processing the fake "stopped" event sent above will normally cause the debugger to close, but if
+                    // the debugger process is already gone (e.g. because the terminal window was closed), we won't get
+                    // a response, so queue a fake "exit" event for processing as well.
+                    ScheduleStdOutProcessing("^exit");
                 }
             }
         }
@@ -1224,6 +1451,12 @@ namespace MICore
                 }
             }
             return value;
+        }
+
+        public void VerifyNotDebuggingCoreDump()
+        {
+            if (this.IsCoreDump)
+                throw new InvalidCoreDumpOperationException();
         }
     }
 }
